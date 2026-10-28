@@ -1,0 +1,9 @@
+# Applications
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+blast
+hmmer
+quantum_espresso
+gnuplot
+pytorch_cpu
+tensorflow_cpu

@@ -1,0 +1,7 @@
+# run output and local notes
+runs/
+*.local.md
+__pycache__/
+*.pyc
+# build products created when a test is run in place
+tests/**/*.o

@@ -1,0 +1,10 @@
+# Compilers: GNU, Intel oneAPI, NVIDIA/CUDA
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+c_hello
+c_hello compiler=intel-oneapi-compilers cc=icx as=c_hello:oneapi
+fortran_hello
+fortran_hello compiler=intel-oneapi-compilers fc=ifx as=fortran_hello:oneapi
+openmp_hello
+openmp_hello compiler=intel-oneapi-compilers cc=icx as=openmp_hello:oneapi
+cuda_vector_add

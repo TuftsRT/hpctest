@@ -1,0 +1,5 @@
+program_options count = 7
+filesystem extension = .txt
+filesystem cwd exists = 1
+regex year = 2025
+date_time day of week = Thu

@@ -1,0 +1,7 @@
+# Everything, including GPU tests and benchmarks
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+@default
+@gpu
+@benchmarks
+@network

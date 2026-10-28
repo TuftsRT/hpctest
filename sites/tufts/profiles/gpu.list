@@ -1,0 +1,3 @@
+# GPU tests, including CUDA-aware OpenMPI on the gpu partition (Tufts-specific)
+@core/gpu
+mpi_hello mpi=openmpi/4.1.8-cuda as=mpi_hello:cuda -- --partition=gpu --gres=gpu:1

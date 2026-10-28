@@ -1,0 +1,11 @@
+Training on CPU...
+Epoch [1/10], Loss: 1.6260
+Epoch [2/10], Loss: 1.6218
+Epoch [3/10], Loss: 1.6177
+Epoch [4/10], Loss: 1.6136
+Epoch [5/10], Loss: 1.6096
+Epoch [6/10], Loss: 1.6056
+Epoch [7/10], Loss: 1.6016
+Epoch [8/10], Loss: 1.5977
+Epoch [9/10], Loss: 1.5938
+Epoch [10/10], Loss: 1.5899

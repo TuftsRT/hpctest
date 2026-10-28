@@ -1,0 +1,4 @@
+${?}On host ${*} GPU selected for this run.
+Using 4 MPI processes
+${?}On host ${*} GPU selected for this run.
+Performance: ${*}

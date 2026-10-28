@@ -1,0 +1,3 @@
+seq_write_MBps ${seq_write}
+seq_read_MBps ${seq_read}
+rand_read_IOPS ${rand_read_iops}

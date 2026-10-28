@@ -1,0 +1,9 @@
+# MPI implementations x compilers, plus parallel I/O
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+mpi_hello
+mpi_hello compiler=gcc mpi=mvapich2 as=mpi_hello:gcc+mvapich2
+mpi_hello compiler=intel-oneapi-compilers mpi=openmpi as=mpi_hello:oneapi+openmpi
+mpi_hello compiler=intel-oneapi-compilers mpi=mvapich2 as=mpi_hello:oneapi+mvapich2
+mpi_hello compiler=intel-oneapi-compilers mpi=intel-oneapi-mpi mpicc=mpiicx as=mpi_hello:intelmpi
+pnetcdf

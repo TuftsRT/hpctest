@@ -1,0 +1,9 @@
+# Main health check: scheduler, compilers, MPI, libraries, languages, applications
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+@scheduler
+@compilers
+@mpi
+@libs
+@lang
+@apps

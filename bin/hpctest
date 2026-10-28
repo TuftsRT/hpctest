@@ -1,0 +1,1835 @@
+#!/usr/bin/env python3
+"""
+hpctest - portable health checks for HPC software modules and the scheduler.
+
+Layout (relative to this file's parent directory):
+  tests/<name>/          portable tests (test.sh with "#@" header, expected.out, ...)
+  profiles/<name>.list   portable profiles
+  sites/<site>/          everything specific to one cluster:
+      site.conf          scheduler, module system, module aliases, paths, policies
+      baselines.conf     benchmark baselines (per CPU architecture)
+      smoke.conf         optional smoke commands for "hpctest modules"
+      profiles/, tests/  site-only additions or overrides
+
+Only the Python 3.6+ standard library is used. See README.md and docs/.
+"""
+
+import argparse
+import concurrent.futures
+import configparser
+import datetime
+import fnmatch
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import statistics
+import string
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+TESTS_DIR = os.path.join(ROOT, "tests")
+PROFILES_DIR = os.path.join(ROOT, "profiles")
+SITES_DIR = os.path.join(ROOT, "sites")
+META = ".hpctest"
+JOB_PREFIX = "hpctest-"
+POLL_SECONDS = 15
+
+STATUS_HELP = [
+    ("PASS", "output, exit code and benchmark values as expected"),
+    ("FAIL", "output or exit code differs from what the test expects"),
+    ("PERF", "output correct but a benchmark value is outside its baseline range"),
+    ("MODULE", "a module failed to load"),
+    ("BUILD", "build.sh (compile step) failed"),
+    ("JOB", "scheduler job ended abnormally (timeout, OOM, node failure, cancelled)"),
+    ("SUBMIT", "the scheduler rejected the job"),
+    ("PENDING", "job had not finished when hpctest stopped waiting"),
+    ("SKIP", "not applicable here (disabled for this site, no GPU partition, --local limits)"),
+]
+STATUS_ORDER = [s for s, _ in STATUS_HELP]
+COLORS = {"PASS": "32", "FAIL": "31", "PERF": "33", "MODULE": "35", "BUILD": "31",
+          "JOB": "31", "SUBMIT": "31", "PENDING": "36", "SKIP": "90"}
+
+# Output lines that never matter.
+NOISE = [re.compile(r"^Warning: no access to tty"),
+         re.compile(r"^Thus no job control in this shell")]
+
+# CPU architecture names recognised in node features by "site init".
+KNOWN_ARCHES = set("""haswell broadwell skylake cascadelake cooperlake icelake sapphirerapids
+emeraldrapids graniterapids knl zen zen2 zen3 zen4 zen5 naples rome milan genoa bergamo
+turin grace neoverse_v1 neoverse_v2 a64fx power9""".split())
+
+
+def color(status, text=None):
+    text = status if text is None else text
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+        return "\033[%sm%s\033[0m" % (COLORS.get(status, "0"), text)
+    return text
+
+
+def die(msg, code=2):
+    print("hpctest: error: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print("hpctest: warning: %s" % msg, file=sys.stderr)
+
+
+def read_lines(path):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read().splitlines()
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def run_cmd(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, **kw)
+
+
+def expand(path):
+    return os.path.expanduser(os.path.expandvars(path.strip()))
+
+
+def new_config():
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",),
+                                   delimiters=("=",))
+    cp.optionxform = str
+    return cp
+
+
+# ==========================================================================
+# Site configuration
+# ==========================================================================
+
+class Site:
+    """Everything cluster-specific, read from sites/<name>/site.conf."""
+
+    def __init__(self, name):
+        self.name = name
+        self.dir = os.path.join(SITES_DIR, name) if name else None
+        self.cp = new_config()
+        if self.dir:
+            path = os.path.join(self.dir, "site.conf")
+            if not os.path.isfile(path):
+                die("site '%s' has no %s (see 'hpctest site list')" % (name, path))
+            self.cp.read(path)
+
+    def get(self, section, key, default=""):
+        if self.cp.has_option(section, key):
+            return self.cp.get(section, key).strip()
+        return default
+
+    def section(self, name):
+        return dict(self.cp.items(name)) if self.cp.has_section(name) else {}
+
+    @property
+    def description(self):
+        return self.get("site", "description", self.name or "(no site)")
+
+    @property
+    def require_allocation(self):
+        return self.get("site", "require_allocation", "no").lower() in ("yes", "true", "1")
+
+    def workdir(self):
+        for cand in self.get("site", "workdir", "~/hpctest-runs").split(","):
+            p = expand(cand)
+            if p and (os.path.isdir(p) or os.path.isdir(os.path.dirname(p.rstrip("/")))):
+                return p
+        return expand("~/hpctest-runs")
+
+    @property
+    def module_init(self):
+        init = self.get("modules", "init")
+        if init:
+            return expand(init)
+        for env in ("LMOD_PKG", "MODULESHOME"):
+            if os.environ.get(env):
+                p = os.path.join(os.environ[env], "init", "bash")
+                if os.path.exists(p):
+                    return p
+        return "/usr/share/lmod/lmod/init/bash"
+
+    @property
+    def module_purge(self):
+        return self.get("modules", "purge", "module purge")
+
+    def resolve_modules(self, names):
+        """Map portable module names to this site's names via [aliases]."""
+        aliases = self.section("aliases")
+        out = []
+        for n in names:
+            out += aliases[n].split() if n in aliases else [n]   # empty alias: load nothing
+        return out
+
+    @property
+    def arch_features(self):
+        return self.get("slurm", "arch_features").split()
+
+    @property
+    def gpu_features(self):
+        return self.get("slurm", "gpu_features").split()
+
+    def disabled(self):
+        return self.section("disabled")
+
+
+def list_sites():
+    if not os.path.isdir(SITES_DIR):
+        return []
+    return sorted(n for n in os.listdir(SITES_DIR) if n != "template" and
+                  os.path.isfile(os.path.join(SITES_DIR, n, "site.conf")))
+
+
+def detect_site(explicit=None):
+    if explicit:
+        return Site(None if explicit == "none" else explicit)
+    if os.environ.get("HPCTEST_SITE"):
+        return Site(os.environ["HPCTEST_SITE"])
+    host = socket.gethostname()
+    sites = list_sites()
+    for name in sites:
+        s = Site(name)
+        pat = s.get("site", "match")
+        if pat and re.search(pat, host):
+            return s
+    if len(sites) == 1:
+        return Site(sites[0])
+    warn("no site matched host '%s'; using built-in defaults (set HPCTEST_SITE or --site)"
+         % host)
+    return Site(None)
+
+
+def guard_allocation(site, what):
+    if site.require_allocation and not os.environ.get("SLURM_JOB_ID"):
+        die("'%s' does work on this node, and site '%s' requires a compute-node allocation.\n"
+            "  Start one first, e.g.: srun -n 2 --mem=4g -t 2:00:00 --pty bash" % (what, site.name))
+
+
+# ==========================================================================
+# Tests, profiles, parameters
+# ==========================================================================
+
+HEADER_RE = re.compile(r"^#@\s*([A-Za-z_-]+)\s*:?\s*(.*)$")
+PARAM_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+class Test:
+    """A test directory. Metadata comes from "#@ key: value" lines in test.sh."""
+
+    def __init__(self, name, path, origin):
+        self.name = name
+        self.path = path
+        self.origin = origin                  # "core" or "site"
+        self.meta = {}
+        self.params = {}
+        for line in read_lines(os.path.join(path, "test.sh")):
+            m = HEADER_RE.match(line.strip())
+            if not m:
+                continue
+            key, val = m.group(1).lower(), m.group(2).strip()
+            if key == "param":
+                pm = PARAM_RE.match(val)
+                if pm:
+                    self.params[pm.group(1)] = pm.group(2).strip()
+            else:
+                self.meta[key] = val
+
+    def file(self, name):
+        return os.path.join(self.path, name)
+
+    def has(self, name):
+        return os.path.exists(self.file(name))
+
+    def m(self, key, default=""):
+        return self.meta.get(key, default)
+
+    def int_m(self, key, default):
+        try:
+            return int(self.m(key, default))
+        except ValueError:
+            return default
+
+    @property
+    def description(self):
+        return self.m("description")
+
+    @property
+    def tags(self):
+        return self.m("tags").replace(",", " ").split()
+
+    @property
+    def nodes(self):
+        return self.int_m("nodes", 1)
+
+    @property
+    def gpus(self):
+        return self.int_m("gpus", 0)
+
+    @property
+    def exclusive(self):
+        return self.m("exclusive", "no").lower() in ("yes", "true", "1")
+
+    def resources(self):
+        bits = ["%dN" % self.nodes]
+        if self.m("ntasks"):
+            bits.append("%sT" % self.m("ntasks"))
+        elif self.m("tasks-per-node"):
+            bits.append("%sT/N" % self.m("tasks-per-node"))
+        if self.m("cpus-per-task"):
+            bits.append("%sC/T" % self.m("cpus-per-task"))
+        if self.gpus:
+            bits.append("%dGPU" % self.gpus)
+        if self.exclusive:
+            bits.append("excl")
+        return ",".join(bits)
+
+
+def discover(site):
+    """Core tests, extended or overridden by sites/<site>/tests."""
+    tests = {}
+    roots = [(TESTS_DIR, "core")]
+    if site.dir:
+        roots.append((os.path.join(site.dir, "tests"), "site"))
+    for root, origin in roots:
+        if os.path.isdir(root):
+            for name in sorted(os.listdir(root)):
+                p = os.path.join(root, name)
+                if os.path.isfile(os.path.join(p, "test.sh")):
+                    tests[name] = Test(name, p, origin)
+    return tests
+
+
+class Entry:
+    """One profile line, or one test named on the command line."""
+
+    def __init__(self, test, params=None, runs=1, need=None, serial=False, sbatch=None,
+                 label=None):
+        self.test = test
+        self.params = dict(params or {})
+        self.runs = runs
+        self.need = runs if need is None else need
+        self.serial = serial
+        self.sbatch = list(sbatch or [])
+        self.label = label
+
+    @property
+    def id(self):
+        if self.label:
+            return self.label
+        if self.params:
+            return "%s:%s" % (self.test, "+".join(self.params.values()))
+        return self.test
+
+
+def profile_path(site, name):
+    """Site profiles override core ones; "core/<name>" always means the core profile."""
+    if name.startswith("core/"):
+        name = name[5:]
+        site = Site(None)
+    roots = ([os.path.join(site.dir, "profiles")] if site.dir else []) + [PROFILES_DIR]
+    for r in roots:
+        p = os.path.join(r, name + ".list")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def list_profiles(site):
+    out = {}
+    roots = [(PROFILES_DIR, "core")]
+    if site.dir:
+        roots.append((os.path.join(site.dir, "profiles"), "site"))
+    for root, origin in roots:
+        if os.path.isdir(root):
+            for f in sorted(os.listdir(root)):
+                if f.endswith(".list"):
+                    out[f[:-5]] = (os.path.join(root, f), origin)
+    return out
+
+
+def parse_profile(site, name, _seen=None):
+    """
+    One entry per line ("#" starts a comment):
+        test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+        @other-profile           include another profile (@core/name: the core one)
+    """
+    _seen = set(_seen or ())
+    if name in _seen:
+        die("profile include loop at '%s'" % name)
+    _seen.add(name)
+    path = profile_path(site, name)
+    if not path:
+        die("profile '%s' not found (see 'hpctest profiles')" % name)
+    entries = []
+    for n, raw in enumerate(read_lines(path), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("@"):
+            entries += parse_profile(site, line[1:].strip(), _seen)
+            continue
+        sbatch = []
+        if " -- " in " %s " % line:
+            line, rest = (" %s " % line).split(" -- ", 1)
+            sbatch = shlex.split(rest)
+        toks = shlex.split(line)
+        e = Entry(toks[0], sbatch=sbatch)
+        need = None
+        for t in toks[1:]:
+            if re.fullmatch(r"x\d+", t):
+                e.runs = int(t[1:])
+            elif t.startswith("need="):
+                need = int(t[5:])
+            elif t == "serial":
+                e.serial = True
+            elif t.startswith("as="):
+                e.label = t[3:]
+            elif "=" in t:
+                k, v = t.split("=", 1)
+                e.params[k] = v
+            else:
+                die("%s:%d: cannot understand '%s'" % (path, n, t))
+        e.need = e.runs if need is None else min(need, e.runs)
+        entries.append(e)
+    return entries
+
+
+def resolve_params(test, site, entry_params, cli_params):
+    """Test default < site [params] (declared params only) < [params:<test>] < profile < --set."""
+    p = dict(test.params)
+    for k, v in site.section("params").items():
+        if k in p:
+            p[k] = v
+    p.update(site.section("params:" + test.name))
+    p.update(entry_params)
+    p.update(cli_params)
+    return p
+
+
+def substitute(text, params):
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)",
+                  lambda m: params.get(m.group(1) or m.group(2), m.group(0)), text)
+
+
+def test_modules(test, site, params):
+    return site.resolve_modules(substitute(test.m("modules"), params).split())
+
+
+# ==========================================================================
+# Output verification
+# ==========================================================================
+
+NUM = r"[\t ]*([-+]?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)[\t ]*"
+TOKEN_RE = re.compile(r"\$\{([^}]*)\}")
+
+
+class Pattern:
+    """One expected line: ${*} any text, ${NAME} a captured number, leading ${?} = optional."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        line = raw.rstrip()
+        self.optional = line.startswith("${?}")
+        if self.optional:
+            line = line[4:]
+        self.tags = []
+        parts, pos = [], 0
+        for m in TOKEN_RE.finditer(line):
+            parts.append(re.escape(line[pos:m.start()]))
+            tok = m.group(1)
+            if tok == "*":
+                parts.append(".*")
+            elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-]*", tok):
+                parts.append(NUM)
+                self.tags.append(tok)
+            else:
+                parts.append(re.escape(m.group(0)))
+            pos = m.end()
+        parts.append(re.escape(line[pos:]))
+        self.regex = re.compile("".join(parts))
+
+    def match(self, text):
+        return self.regex.fullmatch(text)
+
+
+def clean_output(lines):
+    out = [l.rstrip() for l in lines if not any(p.search(l) for p in NOISE)]
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+def compile_expected(lines):
+    pats = [Pattern(l) for l in lines]
+    while pats and pats[-1].raw.strip() in ("", "${*}"):
+        pats.pop()
+    return pats
+
+
+def match_lines(patterns, lines):
+    """Returns (ok, captures, (pattern_index, line_index) of the deepest failure)."""
+    best = [(0, 0)]
+    seen = set()
+
+    def walk(i, j, caps):
+        if (i, j) in seen:
+            return None
+        seen.add((i, j))
+        best[0] = max(best[0], (i, j))
+        if i == len(patterns):
+            return caps if j == len(lines) else None
+        p = patterns[i]
+        if j < len(lines):
+            m = p.match(lines[j])
+            if m:
+                new = dict(caps)
+                new.update(zip(p.tags, m.groups()[:len(p.tags)]))
+                r = walk(i + 1, j + 1, new)
+                if r is not None:
+                    return r
+        return walk(i + 1, j, caps) if p.optional else None
+
+    sys.setrecursionlimit(max(10000, 4 * (len(patterns) + len(lines))))
+    caps = walk(0, 0, {})
+    return (True, caps, None) if caps is not None else (False, {}, best[0])
+
+
+def describe_mismatch(label, patterns, lines, where):
+    i, j = where
+    exp = patterns[i].raw if i < len(patterns) else "<end of expected output>"
+    got = lines[j] if j < len(lines) else "<end of output>"
+    out = ["%s mismatch at line %d:" % (label, j + 1),
+           "    expected: %s" % exp,
+           "    got:      %s" % got]
+    ctx = lines[max(0, j - 2):j + 6]
+    if ctx:
+        out.append("    output near there:")
+        out += ["      | " + l for l in ctx]
+    return out
+
+
+def read_baselines(site):
+    cp = new_config()
+    if site.dir:
+        cp.read(os.path.join(site.dir, "baselines.conf"))
+    return cp
+
+
+def parse_baseline_value(text):
+    f = text.split()
+    return float(f[0]), float(f[1]), float(f[2]), float(f[3]) if len(f) > 3 else 1.0
+
+
+def baselines_for(site, keys, arch):
+    """
+    baselines.conf sections are [key] and [key@arch], where key is a variant id
+    ("mpi_hello:gcc+openmpi") or a test name; [key@arch] entries override [key].
+    """
+    cp = read_baselines(site)
+    for key in keys:
+        secs = [s for s in (key, "%s@%s" % (key, arch) if arch else None)
+                if s and cp.has_section(s)]
+        if not secs:
+            continue
+        merged = {}
+        for s in secs:
+            merged.update(dict(cp.items(s)))
+        ranges = {}
+        for k, v in merged.items():
+            try:
+                ranges[k] = parse_baseline_value(v)
+            except (ValueError, IndexError):
+                warn("baselines.conf [%s] %s: cannot parse '%s'" % (secs[-1], k, v))
+        return ranges, secs[-1]
+    return {}, None
+
+
+def verify(job, site):
+    """Compare a finished job against its expectations. Returns (status, detail, notes)."""
+    d = job["dir"]
+    notes, caps = [], {}
+    for label, actual, expected in (("stdout", "job.out", "expected.out"),
+                                    ("stderr", "job.err", "expected.err")):
+        if label == "stderr" and job.get("stderr") == "ignore":
+            continue
+        lines = clean_output(read_lines(os.path.join(d, actual)))
+        pats = compile_expected(read_lines(os.path.join(d, expected)))
+        ok, got, where = match_lines(pats, lines)
+        if not ok:
+            notes += describe_mismatch(label, pats, lines, where)
+            err = clean_output(read_lines(os.path.join(d, "job.err")))
+            if label == "stdout" and err:
+                notes += ["    stderr (last lines):"] + ["      | " + l for l in err[-6:]]
+            return "FAIL", "%s mismatch at line %d" % (label, where[1] + 1), notes
+        caps.update(got)
+    job["values"] = {k: float(v) for k, v in caps.items()}
+
+    rc = read_lines(os.path.join(d, META, "exit_code"))
+    want = job.get("exit_code", "0")
+    if rc and want != "any" and rc[0] != want:
+        return "FAIL", "test.sh exit code %s (expected %s)" % (rc[0], want), notes
+    if not caps:
+        return "PASS", "", notes
+
+    ranges, section = baselines_for(site, [job["id"], job["test"]], job.get("arch"))
+    if not ranges:
+        return "PASS", "no baseline for %s yet: %s" % (
+            job.get("arch") or "this node",
+            " ".join("%s=%g" % (k, v) for k, v in sorted(job["values"].items()))), notes
+    bad, vals, total, weight = [], [], 0.0, 0.0
+    for tag, (expected, low, high, w) in ranges.items():
+        if tag not in caps:
+            return "FAIL", "value %s not found in output" % tag, notes
+        val = float(caps[tag])
+        pct = (val - expected) / expected * 100 if expected else 0.0
+        vals.append("%s=%g(%+.0f%%)" % (tag, val, pct))
+        total += pct * w
+        weight += abs(w)
+        if not low <= pct <= high:
+            bad.append("%s %+.1f%% (allowed %+g..%+g%%)" % (tag, pct, low, high))
+    summary = "[%s] " % section.split("@", 1)[1] if "@" in section else ""
+    if weight:
+        summary += "%+.1f%% " % (total / weight)
+    if bad:
+        notes.append("values: " + " ".join(vals))
+        return "PERF", summary + "out of range: " + "; ".join(bad), notes
+    return "PASS", summary + " ".join(vals), notes
+
+
+# ==========================================================================
+# Job scripts and the scheduler (Slurm)
+# ==========================================================================
+
+JOB_TEMPLATE = r"""#!/bin/bash
+{directives}
+# Generated by hpctest {version} for {id} (site: {site}). Regenerated on every run.
+cd {dir} || exit 1
+M={dir}/{meta}
+{exports}
+{{
+  hostname -s > "$M/host"
+  if command -v scontrol >/dev/null 2>&1; then
+    scontrol show node "$(hostname -s)" 2>/dev/null | grep -o 'AvailableFeatures=[^ ]*' \
+      | cut -d= -f2 > "$M/features"
+  fi
+  date +%s > "$M/start"
+  type module >/dev/null 2>&1 || source {module_init}
+  {module_purge}
+  for m in {modules}; do
+    if module load "$m" >/dev/null 2>&1 && module is-loaded "$m" >/dev/null 2>&1; then
+      echo "loaded $m"
+    else
+      echo "$m" >> "$M/module_failures"
+      echo "hpctest: FAILED to load module '$m':"
+      module load "$m"
+    fi
+  done
+  module -t list > "$M/modules" 2>&1
+}} > "$M/setup.log" 2>&1
+if [ -s "$M/module_failures" ]; then touch "$M/done"; exit 0; fi
+if [ -f build.sh ]; then
+  bash -e build.sh > "$M/build.log" 2>&1
+  rc=$?
+  if [ $rc -ne 0 ]; then echo $rc > "$M/build_failed"; touch "$M/done"; exit 0; fi
+fi
+bash test.sh
+echo $? > "$M/exit_code"
+date +%s > "$M/end"
+touch "$M/done"
+"""
+
+
+def to_minutes(val):
+    """Minutes from Slurm time syntax: M, M:S, H:M:S, D-H, D-H:M, D-H:M:S."""
+    val = str(val or "").strip()
+    if not val:
+        return None
+    days = 0
+    if "-" in val:
+        d, val = val.split("-", 1)
+        days = int(d)
+        f = [int(x) for x in val.split(":")] + [0, 0]
+        h, mi, s = f[0], f[1], f[2]
+    else:
+        f = [int(x) for x in val.split(":")]
+        if len(f) == 1:
+            h, mi, s = 0, f[0], 0
+        elif len(f) == 2:
+            h, mi, s = 0, f[0], f[1]
+        else:
+            h, mi, s = f[0], f[1], f[2]
+    return days * 1440 + h * 60 + mi + (1 if s else 0)
+
+
+def sbatch_args(test, site, notes):
+    """Translate a test's abstract resources into sbatch options using site.conf."""
+    a = ["--nodes=%d" % test.nodes]
+    for key, opt in (("ntasks", "--ntasks"), ("tasks-per-node", "--ntasks-per-node"),
+                     ("cpus-per-task", "--cpus-per-task"), ("mem", "--mem"),
+                     ("constraint", "--constraint")):
+        if test.m(key):
+            a.append("%s=%s" % (opt, test.m(key)))
+    a.append("--time=%d" % (to_minutes(test.m("time")) or
+                            int(site.get("slurm", "default_time", "15"))))
+    if test.gpus:
+        if site.get("slurm", "gpu_partition"):
+            a.append("--partition=" + site.get("slurm", "gpu_partition"))
+        a += shlex.split(site.get("slurm", "gpu_request", "--gres=gpu:{gpus}")
+                         .format(gpus=test.gpus))
+    elif site.get("slurm", "partition"):
+        a.append("--partition=" + site.get("slurm", "partition"))
+    if test.exclusive:
+        limit = site.get("slurm", "max_exclusive_nodes")
+        if limit and test.nodes > int(limit):
+            notes.append("--exclusive dropped: %d nodes > max_exclusive_nodes=%s"
+                         % (test.nodes, limit))
+        else:
+            a.append("--exclusive")
+    for key in ("account", "qos"):
+        if site.get("slurm", key):
+            a.append("--%s=%s" % (key, site.get("slurm", key)))
+    a += shlex.split(site.get("slurm", "extra"))
+    a += shlex.split(test.m("sbatch"))
+    return a
+
+
+def prepare(job, test, site):
+    dest = job["dir"]
+    shutil.copytree(test.path, dest, symlinks=False,
+                    ignore=shutil.ignore_patterns(".ipynb_checkpoints", "*.ipynb", ".git"))
+    os.makedirs(os.path.join(dest, META), exist_ok=True)
+    notes = []
+    args = sbatch_args(test, site, notes)
+    exports = ["export %s=%s" % (k, shlex.quote(v)) for k, v in sorted(job["params"].items())]
+    exports.append("export HPCTEST_TEST=%s HPCTEST_ID=%s HPCTEST_SITE=%s" % (
+        shlex.quote(job["test"]), shlex.quote(job["id"]), shlex.quote(site.name or "none")))
+    exports.append("export HPCTEST_DIR=%s SLURM_SUBMIT_DIR=%s" % (shlex.quote(dest),
+                                                                  shlex.quote(dest)))
+    script = JOB_TEMPLATE.format(
+        directives="\n".join("#SBATCH " + x for x in args), version=VERSION, id=job["id"],
+        site=site.name, dir=shlex.quote(dest), meta=META, exports="\n".join(exports),
+        module_init=shlex.quote(site.module_init), module_purge=site.module_purge,
+        modules=" ".join(shlex.quote(m) for m in job["modules"]))
+    path = os.path.join(dest, "job.sh")
+    with open(path, "w") as fh:
+        fh.write(script)
+    os.chmod(path, 0o755)
+    job["notes"] = notes
+    job["time_limit"] = to_minutes(test.m("time")) or int(site.get("slurm", "default_time", "15"))
+    return path
+
+
+def submit(job, script, extra, serial):
+    cmd = ["sbatch", "--parsable", "-J", JOB_PREFIX + re.sub(r"[^\w.+-]", "_", job["id"]),
+           "-D", job["dir"], "-o", os.path.join(job["dir"], "job.out"),
+           "-e", os.path.join(job["dir"], "job.err")]
+    if serial:
+        cmd.append("--dependency=singleton")
+    r = run_cmd(cmd + extra + [script])
+    if r.returncode != 0:
+        msg = r.stderr.strip().splitlines()
+        job.update(status="SUBMIT", detail=msg[-1] if msg else "sbatch exit %d" % r.returncode,
+                   done=True)
+    else:
+        job["jobid"] = r.stdout.strip().split(";")[0]
+
+
+QUEUE_REASON = {}
+
+
+def queued_jobs(ids):
+    r = run_cmd(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i %T %r"])
+    if r.returncode != 0:
+        return None
+    state = {}
+    for line in r.stdout.splitlines():
+        f = line.split(None, 2)
+        if len(f) >= 2 and f[0] in ids:
+            state[f[0]] = f[1]
+            QUEUE_REASON[f[0]] = f[2] if len(f) > 2 else ""
+    return state
+
+
+def sacct_states(ids):
+    if not ids:
+        return {}
+    r = run_cmd(["sacct", "-n", "-P", "-X", "-j", ",".join(ids),
+                 "-o", "JobIDRaw,State,ExitCode,NodeList,Elapsed"])
+    out = {}
+    for line in r.stdout.splitlines():
+        f = line.split("|")
+        if len(f) >= 5:
+            out[f[0]] = dict(state=f[1].split()[0], exit=f[2], nodes=f[3], elapsed=f[4])
+    return out
+
+
+def evaluate(job, site, slurm=None):
+    d = job["dir"]
+    meta = os.path.join(d, META)
+    host = read_lines(os.path.join(meta, "host"))
+    if slurm and slurm.get("nodes") and slurm["nodes"] != "None assigned":
+        job["nodes"] = slurm["nodes"]
+    elif host:
+        job["nodes"] = host[0]
+    features = ",".join(read_lines(os.path.join(meta, "features"))).split(",")
+    by = job.get("baseline_by", "cpu")
+    keys = site.gpu_features if by == "gpu" else [] if by == "none" else site.arch_features
+    job["arch"] = next((a for a in keys if a in features), None)
+    start, end = read_lines(os.path.join(meta, "start")), read_lines(os.path.join(meta, "end"))
+    if start and end:
+        job["seconds"] = int(end[0]) - int(start[0])
+    job["loaded"] = [l for l in read_lines(os.path.join(meta, "modules"))
+                     if l and not l.endswith(":")]
+    pre = list(job.get("notes") or [])
+
+    failures = read_lines(os.path.join(meta, "module_failures"))
+    if failures:
+        return "MODULE", "cannot load: " + ", ".join(failures), pre + \
+            ["module setup log:"] + ["    " + l for l in
+                                      read_lines(os.path.join(meta, "setup.log"))[-12:]]
+    if os.path.exists(os.path.join(meta, "build_failed")):
+        log = read_lines(os.path.join(meta, "build.log"))
+        return "BUILD", "build.sh exit %s" % read_lines(os.path.join(meta, "build_failed"))[0], \
+            pre + ["build log (last lines):"] + ["    " + l for l in log[-15:]]
+    if not os.path.exists(os.path.join(meta, "done")):
+        state = slurm["state"] if slurm else "UNKNOWN"
+        if state in ("RUNNING", "PENDING", "COMPLETING", "CONFIGURING"):
+            return "PENDING", "job %s" % state, []
+        err = read_lines(os.path.join(d, "job.err"))
+        return "JOB", "job ended without finishing (%s)" % state, pre + \
+            ((["job stderr (last lines):"] + ["    " + l for l in err[-10:]]) if err else [])
+    status, detail, notes = verify(job, site)
+    return status, detail, pre + notes
+
+
+# ==========================================================================
+# run
+# ==========================================================================
+
+def build_entries(args, site, tests):
+    entries = []
+    for p in args.profile or []:
+        entries += parse_profile(site, p)
+    for name in args.tests:
+        if name.startswith("tag:"):
+            matched = [t for t in sorted(tests) if name[4:] in tests[t].tags]
+        elif any(c in name for c in "*?["):
+            matched = [t for t in sorted(tests) if fnmatch.fnmatch(t, name)]
+        else:
+            matched = [name]
+        if not matched:
+            die("nothing matches '%s'" % name)
+        entries += [Entry(t) for t in matched]
+    if getattr(args, "all", False):
+        entries += [Entry(t) for t in sorted(tests)]
+    if not entries:
+        die("nothing to run: give test names, tag:<tag>, -p PROFILE or --all "
+            "(see 'hpctest list')")
+    if getattr(args, "repeat", None):
+        for e in entries:
+            e.runs = args.repeat
+            e.need = args.repeat if args.need is None else min(args.need, args.repeat)
+    unknown = sorted({e.test for e in entries if e.test not in tests})
+    if unknown:
+        die("unknown test(s): %s" % ", ".join(unknown))
+    seen, out = set(), []
+    for e in entries:
+        if e.id not in seen:
+            seen.add(e.id)
+            out.append(e)
+    return out
+
+
+def parse_set(pairs):
+    out = {}
+    for p in pairs or []:
+        if "=" not in p:
+            die("--set expects PARAM=VALUE, got '%s'" % p)
+        k, v = p.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def skip_reason(test, entry_id, site, local, params):
+    dis = site.disabled()
+    for key in (entry_id, test.name):
+        if key in dis:
+            return "disabled for site %s: %s" % (site.name, dis[key] or "no reason given")
+    for need in test.m("requires-param").split():
+        if not params.get(need):
+            return "needs site parameter '%s' (set it in site.conf [params])" % need
+    if test.gpus and site.dir and not site.get("slurm", "gpu_partition") \
+            and not site.get("slurm", "gpu_request"):
+        return "needs a GPU; site.conf sets no gpu_partition/gpu_request"
+    if local:
+        if test.m("local", "yes").lower() == "no":
+            return "needs a real scheduler job (#@ local: no)"
+        if test.nodes > 1:
+            return "needs %d nodes" % test.nodes
+        if test.gpus and not shutil.which("nvidia-smi"):
+            return "needs a GPU"
+    return None
+
+
+def make_jobs(entries, tests, site, cli_params, rundir, local):
+    jobs = []
+    for e in entries:
+        t = tests[e.test]
+        params = resolve_params(t, site, e.params, cli_params)
+        why = skip_reason(t, e.id, site, local, params)
+        base = re.sub(r"[^\w.+@-]", "_", e.id.replace(":", "@"))
+        for r in range(1, e.runs + 1):
+            jobs.append(dict(
+                test=t.name, id=e.id, rep=r, jobid=None,
+                dir=os.path.join(rundir, "%s.%d" % (base, r) if e.runs > 1 else base),
+                status="SKIP" if why else None, detail=why or "", done=bool(why),
+                need=e.need, runs=e.runs, sbatch=e.sbatch, serial=e.serial, params=params,
+                modules=test_modules(t, site, params),
+                stderr=t.m("stderr", "check").lower(), exit_code=t.m("exit-code", "0").lower(),
+                baseline_by=t.m("baseline-by", "cpu").lower()))
+    return jobs
+
+
+def cmd_run(args, site=None):
+    site = site or detect_site(args.site)
+    tests = discover(site)
+    entries = build_entries(args, site, tests)
+    cli_params = parse_set(args.set)
+    extra = list(args.sbatch or [])
+    if args.local:
+        guard_allocation(site, "run --local")
+    elif not shutil.which("sbatch"):
+        die("sbatch not found; use --local inside an allocation")
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    rid = stamp + "-" + "".join(random.choice(string.ascii_lowercase) for _ in range(4))
+    rundir = os.path.abspath(os.path.join(args.workdir or site.workdir(), rid))
+    os.makedirs(rundir)
+    args.rundir = rundir
+    jobs = make_jobs(entries, tests, site, cli_params, rundir, args.local)
+    manifest = dict(version=VERSION, created=stamp, rundir=rundir, site=site.name,
+                    mode="local" if args.local else "slurm", argv=sys.argv,
+                    params=cli_params, sbatch=extra, jobs=jobs)
+    save_manifest(manifest)
+    print("hpctest %s  site: %s  tests: %d  jobs: %d\nrun directory: %s"
+          % (VERSION, site.name, len(entries), len(jobs), rundir))
+
+    if args.local:
+        run_local(jobs, tests, site, args)
+    else:
+        for j in jobs:
+            if not j["done"]:
+                submit(j, prepare(j, tests[j["test"]], site), extra + j["sbatch"], j["serial"])
+        save_manifest(manifest)
+        print("submitted %d job(s)" % sum(1 for j in jobs if j["jobid"]))
+        if args.no_wait:
+            print("Not waiting. Check later with:\n  hpctest report %s" % rundir)
+            return 0
+        wait_for_jobs(jobs, site, manifest, args)
+    save_manifest(manifest)
+    return report(manifest, site, args)
+
+
+def run_local(jobs, tests, site, args):
+    def one(j):
+        if j["done"]:
+            return j
+        script = prepare(j, tests[j["test"]], site)
+        limit = j["time_limit"] * 60
+        with open(os.path.join(j["dir"], "job.out"), "w") as out, \
+                open(os.path.join(j["dir"], "job.err"), "w") as err:
+            try:
+                subprocess.run(["bash", script], stdout=out, stderr=err, cwd=j["dir"],
+                               timeout=limit, start_new_session=True)
+            except subprocess.TimeoutExpired:
+                j.update(status="JOB", detail="timed out after %d min" % (limit // 60),
+                         done=True)
+                return j
+        status, detail, notes = evaluate(j, site)
+        j.update(status=status, detail=detail, notes=notes, done=True)
+        return j
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        for j in pool.map(one, jobs):
+            if not args.quiet:
+                print("  %-8s %s%s" % (color(j["status"]), j["id"],
+                                       " (%s)" % j["detail"] if j["detail"] else ""))
+
+
+def wait_for_jobs(jobs, site, manifest, args):
+    pending = {j["jobid"]: j for j in jobs if j["jobid"] and not j["done"]}
+    deadline = time.time() + args.timeout * 60
+
+    def cancel(signum=None, frame=None):
+        ids = [i for i, j in pending.items() if not j["done"]]
+        if ids:
+            print("\nhpctest: cancelling %d job(s)" % len(ids))
+            run_cmd(["scancel"] + ids)
+        save_manifest(manifest)
+        if signum:
+            sys.exit(130)
+
+    signal.signal(signal.SIGINT, cancel)
+    signal.signal(signal.SIGTERM, cancel)
+    tty = sys.stdout.isatty() and not args.quiet
+    while pending:
+        time.sleep(3 if tty and len(pending) < 3 else POLL_SECONDS)
+        queue = queued_jobs(set(pending))
+        if queue is None:
+            continue
+        finished = [i for i in pending if i not in queue]
+        acct = sacct_states(finished)
+        for i in finished:
+            j = pending.pop(i)
+            status, detail, notes = evaluate(j, site, acct.get(i))
+            if status == "PENDING":
+                status, detail = "JOB", "job left the queue without finishing"
+            j.update(status=status, detail=detail, notes=notes, done=True)
+            if not args.quiet:
+                line = "  %-8s %s%s" % (color(status), j["id"],
+                                        " (%s)" % detail if detail else "")
+                print(("\r\033[K" if tty else "") + line)
+        if tty and pending:
+            states = list(queue.values())
+            sys.stdout.write("\r\033[K  ... %d running, %d pending, %d done"
+                             % (states.count("RUNNING"), len(pending) - states.count("RUNNING"),
+                                sum(1 for j in jobs if j["done"])))
+            sys.stdout.flush()
+        save_manifest(manifest)
+        if time.time() > deadline and pending:
+            print("\nhpctest: gave up waiting after %d minutes" % args.timeout)
+            for j in pending.values():
+                why = QUEUE_REASON.get(j["jobid"], "")
+                j.update(status="PENDING", detail="job %s still queued/running%s" % (
+                    j["jobid"], ", reason " + why if why and why != "None" else ""))
+            if args.cancel_on_timeout:
+                cancel()
+            break
+    if tty:
+        sys.stdout.write("\r\033[K")
+
+
+def save_manifest(manifest):
+    tmp = os.path.join(manifest["rundir"], ".manifest.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    os.replace(tmp, os.path.join(manifest["rundir"], "manifest.json"))
+
+
+def load_manifest(rundir):
+    path = os.path.join(os.path.abspath(rundir), "manifest.json")
+    if not os.path.isfile(path):
+        die("%s has no manifest.json" % rundir)
+    with open(path) as fh:
+        return json.load(fh)
+
+
+# ==========================================================================
+# report
+# ==========================================================================
+
+def summarize(jobs):
+    order, groups = [], {}
+    for j in jobs:
+        if j["id"] not in groups:
+            order.append(j["id"])
+            groups[j["id"]] = []
+        groups[j["id"]].append(j)
+    rows = []
+    for key in order:
+        js = groups[key]
+        need, runs = js[0]["need"], js[0]["runs"]
+        npass = sum(1 for j in js if j["status"] == "PASS")
+        bad = [j for j in js if j["status"] not in ("PASS", "SKIP", "PENDING")]
+        if all(j["status"] == "SKIP" for j in js):
+            status = "SKIP"
+        elif npass >= need:
+            status = "PASS"
+        elif len(bad) > runs - need:
+            cats = [j["status"] for j in bad]
+            status = max(set(cats), key=cats.count)
+        else:
+            status = "PENDING"
+        detail = next((j["detail"] for j in js if j["status"] == status and j["detail"]),
+                      next((j["detail"] for j in js if j["detail"]), ""))
+        rows.append(dict(id=key, test=js[0]["test"], status=status, passed=npass, runs=runs,
+                         need=need, detail=detail,
+                         nodes=sorted({j["nodes"] for j in js if j.get("nodes")}),
+                         failed_nodes=sorted({j["nodes"] for j in bad if j.get("nodes")}),
+                         modules=js[0].get("loaded") or js[0].get("modules") or [], jobs=js))
+    return rows
+
+
+def report(manifest, site, args):
+    rows = summarize(manifest["jobs"])
+    rundir = manifest["rundir"]
+    width = max([len(r["id"]) for r in rows] + [4])
+    print()
+    print("%-7s  %-*s  %5s  %s" % ("STATUS", width, "TEST", "PASS", "DETAIL"))
+    print("%-7s  %-*s  %5s  %s" % ("-" * 7, width, "-" * width, "-" * 5, "-" * 40))
+    for r in rows:
+        print("%s  %-*s  %5s  %s" % (color(r["status"], "%-7s" % r["status"]), width, r["id"],
+                                     "%d/%d" % (r["passed"], r["runs"]), r["detail"][:110]))
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print("\nSummary: " + ", ".join("%d %s" % (counts[s], s) for s in STATUS_ORDER
+                                    if s in counts))
+    failed_nodes = sorted({n for r in rows for n in r["failed_nodes"]})
+    if failed_nodes and getattr(args, "nodes", False):
+        print("Nodes with failures: " + " ".join(failed_nodes))
+
+    if not args.quiet:
+        shown = False
+        for r in rows:
+            if r["status"] in ("PASS", "SKIP", "PENDING"):
+                continue
+            j = next(j for j in r["jobs"] if j["status"] not in ("PASS", "SKIP"))
+            if not shown:
+                print("\nFailure details:")
+                shown = True
+            print("\n[%s] %s%s" % (j["status"], j["id"],
+                                   "  node " + j["nodes"] if j.get("nodes") else ""))
+            print("    " + j["detail"])
+            for line in (j.get("notes") or [])[:25]:
+                print("    " + line)
+            print("    modules: %s" % (" ".join(j.get("loaded") or j.get("modules") or []) or "-"))
+            print("    files:   %s" % j["dir"])
+
+    write_results(rundir, rows)
+    if getattr(args, "syslog", False) and shutil.which("logger"):
+        for r in rows:
+            run_cmd(["logger", "-t", "hpctest", "%s %s %d/%d %s" % (
+                r["id"], r["status"], r["passed"], r["runs"], r["detail"])])
+    keep = getattr(args, "keep", False)
+    if not keep:
+        for r in rows:
+            for j in r["jobs"]:
+                if j["status"] == "PASS" and os.path.isdir(j["dir"]):
+                    shutil.rmtree(j["dir"], ignore_errors=True)
+    print("\nResults: %s/results.tsv%s" % (
+        rundir, "" if keep else "  (passing test directories removed; --keep keeps them)"))
+    return 1 if any(r["status"] not in ("PASS", "SKIP") for r in rows) else 0
+
+
+def write_results(rundir, rows):
+    with open(os.path.join(rundir, "results.tsv"), "w") as fh:
+        fh.write("test\tstatus\tpassed\truns\tneed\tnodes\tmodules\tdetail\n")
+        for r in rows:
+            fh.write("\t".join([r["id"], r["status"], str(r["passed"]), str(r["runs"]),
+                                str(r["need"]), ",".join(r["nodes"]), " ".join(r["modules"]),
+                                r["detail"].replace("\t", " ")]) + "\n")
+    with open(os.path.join(rundir, "results.json"), "w") as fh:
+        json.dump([{k: v for k, v in r.items() if k != "jobs"} for r in rows], fh, indent=1)
+
+
+def cmd_report(args):
+    manifest = load_manifest(args.rundir)
+    site = detect_site(args.site or manifest.get("site") or "none")
+    jobs = manifest["jobs"]
+    open_ids = [j["jobid"] for j in jobs if j.get("jobid") and j.get("status") in (None, "PENDING")]
+    queue = (queued_jobs(set(open_ids)) or {}) if open_ids else {}
+    acct = sacct_states([i for i in open_ids if i not in queue])
+    for j in jobs:
+        recheck = args.recheck and j.get("status") in ("PASS", "FAIL", "PERF")
+        if (j.get("status") in (None, "PENDING") or recheck) and os.path.isdir(j["dir"]):
+            if j.get("jobid") in queue:
+                j.update(status="PENDING", detail="job %s %s" % (j["jobid"], queue[j["jobid"]]))
+            else:
+                s, d, n = evaluate(j, site, acct.get(j.get("jobid")))
+                j.update(status=s, detail=d, notes=n, done=True)
+    save_manifest(manifest)
+    return report(manifest, site, args)
+
+
+# ==========================================================================
+# list / profiles / show / check
+# ==========================================================================
+
+def cmd_list(args):
+    site = detect_site(args.site)
+    tests = discover(site)
+    if args.profile:
+        rows = [(e.id, e.test, e.params) for p in args.profile for e in parse_profile(site, p)]
+    else:
+        rows = [(n, n, {}) for n in sorted(tests)]
+    if args.tag:
+        rows = [r for r in rows if r[1] in tests and args.tag in tests[r[1]].tags]
+    if args.names:
+        print("\n".join(r[0] for r in rows))
+        return 0
+    dis = site.disabled()
+    width = max([len(r[0]) for r in rows] + [4])
+    print("%-*s  %-13s  %-36s  %s" % (width, "TEST", "RESOURCES", "MODULES (as loaded here)",
+                                      "DESCRIPTION"))
+    for rid, name, eparams in rows:
+        t = tests.get(name)
+        if not t:
+            print("%-*s  %s" % (width, rid, color("FAIL", "<no such test>")))
+            continue
+        params = resolve_params(t, site, eparams, {})
+        mods = " ".join(test_modules(t, site, params)) or "-"
+        desc = t.description
+        if rid in dis or name in dis:
+            desc = color("SKIP", "[disabled] ") + desc
+        print("%-*s  %-13s  %-36s  %s" % (width, rid + ("*" if t.origin == "site" else ""),
+                                          t.resources(), mods[:36], desc[:70]))
+    print("\n* = site-specific test.  Tags: %s" % " ".join(sorted({g for t in tests.values()
+                                                                  for g in t.tags})))
+    return 0
+
+
+def cmd_profiles(args):
+    site = detect_site(args.site)
+    tests = discover(site)
+    for name, (path, origin) in sorted(list_profiles(site).items()):
+        entries = parse_profile(site, name)
+        missing = sorted({e.test for e in entries if e.test not in tests})
+        desc = next((l.lstrip("# ").strip() for l in read_lines(path)
+                     if l.startswith("#") and l.strip("# ")), "")
+        line = "%-16s %3d jobs  %-4s  %s" % (name, sum(e.runs for e in entries), origin,
+                                             desc[:70])
+        if missing:
+            line += "  " + color("FAIL", "missing: " + " ".join(missing))
+        print(line)
+    return 0
+
+
+def cmd_show(args):
+    site = detect_site(args.site)
+    tests = discover(site)
+    for name in args.tests:
+        t = tests.get(name) or die("unknown test '%s'" % name)
+        params = resolve_params(t, site, {}, parse_set(args.set))
+        print("== %s  (%s)" % (name, t.path))
+        print("description: %s" % t.description)
+        print("params:      %s" % (" ".join("%s=%s" % kv for kv in params.items()) or "-"))
+        print("modules:     %s" % (" ".join(test_modules(t, site, params)) or "-"))
+        print("sbatch:      %s" % " ".join(sbatch_args(t, site, [])))
+        for f in ("build.sh", "test.sh", "expected.out", "expected.err"):
+            if t.has(f):
+                print("---- %s" % f)
+                print("\n".join(read_lines(t.file(f))[:80]))
+    return 0
+
+
+PROBE_SCRIPT = r"""
+type module >/dev/null 2>&1 || source "$1"
+eval "$2" >/dev/null 2>&1
+shift 2
+failed=""
+for m in "$@"; do
+  if module load "$m" >/dev/null 2>&1 && module is-loaded "$m" >/dev/null 2>&1; then :;
+  else failed="$failed $m"; fi
+done
+echo "@@FAILED$failed"
+echo "@@LOADED $(module -t list 2>&1 | grep -v ':$' | tr '\n' ' ')"
+"""
+
+
+def load_modules_probe(site, modules):
+    r = run_cmd(["bash", "-c", PROBE_SCRIPT, "probe", site.module_init, site.module_purge]
+                + list(modules), timeout=300)
+    failed, loaded = [], []
+    for line in r.stdout.splitlines():
+        if line.startswith("@@FAILED"):
+            failed = line.split()[1:]
+        elif line.startswith("@@LOADED"):
+            loaded = line.split()[1:]
+    return failed, loaded
+
+
+def cmd_check(args):
+    """Load every selected test's modules on this node (no jobs)."""
+    site = detect_site(args.site)
+    guard_allocation(site, "check")
+    tests = discover(site)
+    entries = build_entries(args, site, tests) if (args.tests or args.profile or args.all) \
+        else [Entry(t) for t in sorted(tests)]
+    cli = parse_set(args.set)
+    dis = site.disabled()
+    work = []
+    for e in entries:
+        t = tests[e.test]
+        work.append((e.id, test_modules(t, site, resolve_params(t, site, e.params, cli)),
+                     e.id in dis or t.name in dis))
+    width = max(len(w[0]) for w in work)
+    bad = 0
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        futs = [(w, pool.submit(load_modules_probe, site, w[1]) if w[1] and not w[2] else None)
+                for w in work]
+        for (wid, mods, disabled), fut in futs:
+            if disabled:
+                if not args.quiet:
+                    print("%s  %-*s  disabled for this site" % (color("SKIP", "SKIP   "),
+                                                                 width, wid))
+                continue
+            failed, loaded = fut.result() if fut else ([], [])
+            if failed:
+                bad += 1
+                print("%s  %-*s  cannot load: %s" % (color("MODULE", "MISSING"), width, wid,
+                                                     " ".join(failed)))
+            elif not args.quiet:
+                shown = loaded if args.verbose else [m for m in loaded if "/" in m]
+                print("%s  %-*s  %s" % (color("PASS", "OK     "), width, wid,
+                                        " ".join(shown)[:110] or "(no modules)"))
+    print("\n%d of %d tests have module problems" % (bad, len(work)))
+    if bad:
+        print("Fix: map the name under [aliases] in sites/%s/site.conf, or add the test to "
+              "[disabled]." % (site.name or "<site>"))
+    return 1 if bad else 0
+
+
+# ==========================================================================
+# modules: sweep the whole module catalog
+# ==========================================================================
+
+AVAIL_SCRIPT = r"""
+type module >/dev/null 2>&1 || source "$1"
+eval "$2" >/dev/null 2>&1
+for p in $3; do module load "$p" >/dev/null 2>&1; done
+module -t avail 2>&1
+"""
+
+SWEEP_SCRIPT = r"""
+type module >/dev/null 2>&1 || source "$1"
+eval "$2" >/dev/null 2>&1
+for p in $3; do module load "$p" >/dev/null 2>&1; done
+before=":$PATH:$LD_LIBRARY_PATH:"
+if ! module load "$4" >/dev/null 2>&1 || ! module is-loaded "$4" >/dev/null 2>&1; then
+  echo "@@LOADFAIL"; module load "$4" 2>&1 | grep -v '^\s*$' | head -4; exit 0
+fi
+IFS=:
+for d in $PATH $LD_LIBRARY_PATH; do
+  case "$before" in *":$d:"*) ;; *) [ -n "$d" ] && [ ! -d "$d" ] && echo "@@MISSINGDIR $d";; esac
+done
+unset IFS
+if [ -n "$5" ]; then
+  out=$(timeout "$6" bash -c "$5" </dev/null 2>&1); rc=$?
+  [ $rc -ne 0 ] && { echo "@@SMOKEFAIL rc=$rc"; echo "$out" | tail -3; }
+fi
+echo "@@OK"
+"""
+
+
+def module_catalog(site, preload):
+    r = run_cmd(["bash", "-c", AVAIL_SCRIPT, "avail", site.module_init, site.module_purge,
+                 " ".join(preload)], timeout=600)
+    mods = set()
+    for line in r.stdout.splitlines():
+        line = re.sub(r"\s*<[^>]*>|\s*\((default|D|L)\)", "", line.strip()).strip()
+        if line and not line.endswith(":") and not line.endswith("/") \
+                and not line.startswith("-") and " " not in line:
+            mods.add(line)
+    return sorted(mods)
+
+
+def read_smoke(site):
+    cp = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+    cp.optionxform = str
+    if site.dir:
+        cp.read(os.path.join(site.dir, "smoke.conf"))
+    return dict(cp.items("smoke")) if cp.has_section("smoke") else {}
+
+
+def cmd_modules(args):
+    """Load every module in the catalog (optionally after --with modules) and report failures."""
+    site = detect_site(args.site)
+    guard_allocation(site, "modules")
+    preload = site.resolve_modules(args.with_ or [])
+    mods = module_catalog(site, preload)
+    if preload:
+        mods = [m for m in mods if m not in module_catalog(site, [])]
+    if args.patterns:
+        mods = [m for m in mods if any(fnmatch.fnmatch(m, p) or fnmatch.fnmatch(m.split("/")[0], p)
+                                       for p in args.patterns)]
+    if not mods:
+        die("no modules found (module init: %s)" % site.module_init)
+    smoke = read_smoke(site)
+    print("hpctest: loading %d module(s)%s on %s" % (
+        len(mods), " (after loading %s)" % " ".join(preload) if preload else "",
+        socket.gethostname().split(".")[0]))
+
+    def one(m):
+        cmd = smoke.get(m) or smoke.get(m.split("/")[0]) or ""
+        try:
+            r = run_cmd(["bash", "-c", SWEEP_SCRIPT, "sweep", site.module_init, site.module_purge,
+                         " ".join(preload), m, cmd, str(args.smoke_timeout)],
+                        timeout=args.smoke_timeout + 120)
+        except subprocess.TimeoutExpired:
+            return m, "FAIL", "timed out"
+        out = r.stdout.splitlines()
+        text = [l for l in out if not l.startswith("@@")]
+        if "@@LOADFAIL" in out:
+            return m, "FAIL", "load failed: " + " | ".join(text)[:150]
+        sf = [l for l in out if l.startswith("@@SMOKEFAIL")]
+        if sf:
+            return m, "FAIL", "smoke '%s' %s: %s" % (cmd, sf[0].split()[1], " | ".join(text)[:110])
+        missing = [l.split(None, 1)[1] for l in out if l.startswith("@@MISSINGDIR")]
+        if missing:
+            return m, "WARN", "adds nonexistent dir(s): " + " ".join(missing)[:150]
+        return m, "OK", "smoke ok" if cmd else ""
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        for m, st, msg in pool.map(one, mods):
+            results.append((m, st, msg))
+            if st != "OK" or args.verbose:
+                tag = {"OK": "PASS", "WARN": "PERF", "FAIL": "FAIL"}[st]
+                print("  %s  %-45s %s" % (color(tag, "%-4s" % st), m, msg))
+    n = {s: sum(1 for r in results if r[1] == s) for s in ("OK", "WARN", "FAIL")}
+    print("\n%d modules: %d OK, %d WARN, %d FAIL" % (len(results), n["OK"], n["WARN"], n["FAIL"]))
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write("module\tstatus\tdetail\n")
+            fh.writelines("\t".join(r) + "\n" for r in results)
+        print("Written: %s" % args.output)
+    return 1 if n["FAIL"] else 0
+
+
+# ==========================================================================
+# calibrate: measure baselines and write baselines.conf
+# ==========================================================================
+
+def cmd_calibrate(args):
+    site = detect_site(args.site)
+    if not site.dir:
+        die("calibrate needs a site directory (hpctest site init <name>)")
+    if args.from_:
+        jobs = [j for d in args.from_ for j in load_manifest(d)["jobs"]]
+    else:
+        args.keep, args.no_wait, args.local = True, False, False
+        cmd_run(args, site)
+        jobs = load_manifest(args.rundir)["jobs"]
+    samples = {}
+    for j in jobs:
+        if not j.get("values") or j.get("status") in ("FAIL", "MODULE", "BUILD", "JOB"):
+            continue
+        sec = j["id"] + ("@" + j["arch"] if j.get("arch") and not args.no_arch else "")
+        for k, v in j["values"].items():
+            samples.setdefault(sec, {}).setdefault(k, []).append(v)
+    if not samples:
+        print("\nNo benchmark values captured (tests report them with ${NAME} patterns).")
+        return 1
+    path = os.path.join(site.dir, "baselines.conf")
+    cp = read_baselines(site)
+    low, high = [float(x) for x in args.tolerance.split(",")]
+    print("\nMeasured (median of passing runs):")
+    for sec, vals in sorted(samples.items()):
+        if not cp.has_section(sec):
+            cp.add_section(sec)
+        base = sec.split("@")[0]
+        for k, vs in sorted(vals.items()):
+            med = statistics.median(vs)
+            lo, hi, w = low, high, 1.0
+            for s in (sec, base):
+                if cp.has_option(s, k):
+                    try:
+                        _, lo, hi, w = parse_baseline_value(cp.get(s, k))
+                    except (ValueError, IndexError):
+                        pass
+                    break
+            cp.set(sec, k, "%.4g %g %g %g" % (med, lo, hi, w))
+            print("  [%s] %s = %.4g   (n=%d, range %.4g..%.4g)" % (sec, k, med, len(vs),
+                                                                    min(vs), max(vs)))
+    if args.dry_run:
+        print("\n--dry-run: %s not changed" % path)
+        return 0
+    header = [l for l in read_lines(path) if l.startswith("#")] or [
+        "# Benchmark baselines for site %s." % site.name,
+        "# NAME = expected low%% high%% [weight]   (weight < 0: lower is better)",
+        "# Sections: [test] or [test@arch]. Written by 'hpctest calibrate'; edit freely."]
+    with open(path, "w") as fh:
+        fh.write("\n".join(header) + "\n\n")
+        cp.write(fh)
+    print("\nUpdated %s" % path)
+    return 0
+
+
+# ==========================================================================
+# site: list / show / init
+# ==========================================================================
+
+SITE_TEMPLATE = """# hpctest site configuration: {name}
+# Generated by 'hpctest site init' on {date} on host {host}. Review every value.
+
+[site]
+description = {name} cluster
+# Regex matched against the hostname to select this site automatically.
+match = {match}
+# Where run directories go; the first usable entry wins ($VARS and ~ allowed).
+workdir = {workdir}
+# yes = refuse to load modules / run --local outside a scheduler allocation.
+require_allocation = no
+
+[modules]
+# Shell init file of the module command (Lmod or Environment Modules 4+).
+init = {init}
+purge = {purge}
+
+[slurm]
+# Partition for CPU tests (empty = cluster default) and for GPU tests.
+partition =
+gpu_partition = {gpu_partition}
+# How to request GPUs; {{gpus}} becomes the count.
+gpu_request = --gres=gpu:{{gpus}}
+account =
+qos =
+# Extra sbatch options for every job.
+extra =
+# Largest node count allowed to use --exclusive (per-user CPU limits); empty = no limit.
+max_exclusive_nodes =
+# Node features naming CPU architectures; benchmark baselines are kept per architecture.
+arch_features = {arches}
+# Node features naming GPU models; GPU benchmarks ("#@ baseline-by: gpu") use these.
+gpu_features = {gpu_models}
+# Time limit (minutes) for tests that do not set one.
+default_time = 15
+
+[aliases]
+# portable name = this site's module name(s); an empty value loads nothing.
+# Commented lines were found as-is. NOT FOUND lines need a value or a [disabled] entry.
+{aliases}
+
+[params]
+# Site-wide values for test parameters ("hpctest show <test>" lists a test's params).
+# A [params:<test>] section sets parameters for one test only.
+{params}
+
+[disabled]
+# test (or test:variant) = reason   -- reported as SKIP
+"""
+
+
+def cmd_site(args):
+    if args.action == "list":
+        for n in list_sites():
+            s = Site(n)
+            print("%-14s %s   (match: %s)" % (n, s.description, s.get("site", "match") or "-"))
+        return 0
+    if args.action == "show":
+        site = detect_site(args.name or args.site)
+        print("site:        %s  (%s)" % (site.name, site.dir))
+        print("description: %s" % site.description)
+        print("workdir:     %s" % site.workdir())
+        print("module init: %s" % site.module_init)
+        for sec in site.cp.sections():
+            print("[%s]" % sec)
+            for k, v in site.cp.items(sec):
+                print("  %s = %s" % (k, v))
+        return 0
+    return site_init(args)
+
+
+def site_init(args):
+    name = args.name or die("usage: hpctest site init <name>")
+    dest = os.path.join(SITES_DIR, name)
+    if os.path.exists(os.path.join(dest, "site.conf")) and not args.force:
+        die("%s/site.conf exists (use --force to overwrite)" % dest)
+    host = socket.gethostname().split(".")[0]
+    print("Probing scheduler and module system from %s ..." % host)
+    gpu_nodes, arches, gpu_models = {}, set(), set()
+    if shutil.which("sinfo"):
+        for line in run_cmd(["sinfo", "-h", "-o", "%P|%G|%f|%D"]).stdout.splitlines():
+            part, gres, feats, count = (line.split("|") + ["", "", "", "0"])[:4]
+            part = part.rstrip("*")
+            if "gpu" in gres:
+                gpu_nodes[part] = gpu_nodes.get(part, 0) + int(count or 0)
+                for g in gres.split(","):
+                    f = g.split("(")[0].split(":")
+                    if f[0] == "gpu" and len(f) == 3 and f[1] in feats.split(","):
+                        gpu_models.add(f[1])
+            arches |= {f for f in feats.split(",") if f.lower() in KNOWN_ARCHES}
+    # Prefer a partition called gpu*, else the one with the most GPU nodes.
+    gpu_part = min(gpu_nodes, key=lambda p: (not p.lower().startswith("gpu"), -gpu_nodes[p], p)) \
+        if gpu_nodes else ""
+    blank = Site(None)
+    init = blank.module_init
+    purge = "module --force purge" if os.environ.get("LMOD_VERSION") else "module purge"
+
+    tests = discover(blank)
+    names, params = set(), {}
+    combos = [(t, {}) for t in tests.values()]
+    for p in list_profiles(blank):
+        combos += [(tests[e.test], e.params) for e in parse_profile(blank, p) if e.test in tests]
+    for t, eparams in combos:
+        pv = dict(t.params)
+        pv.update(eparams)
+        names.update(substitute(t.m("modules"), pv).split())
+    for t in tests.values():
+        for k in t.m("requires-param").split():
+            params[k] = t.params.get(k, "")
+    print("Checking %d portable module names against 'module avail' ..." % len(names))
+    avail = module_catalog(blank, [])
+    avail_set = set(avail) | {m.split("/")[0] for m in avail}
+    alias_lines = []
+    for n in sorted(names):
+        if n in avail_set:
+            alias_lines.append("# %s = %s" % (n, n))
+        else:
+            key = n.split("/")[0].lower()
+            stem = re.split(r"[-_]", key)[0]
+            cands = sorted({a.split("/")[0] for a in avail
+                            if key.replace("-", "") in a.lower().replace("-", "")
+                            or a.lower().split("/")[0].startswith(stem)})[:5]
+            alias_lines.append("%s =    # NOT FOUND%s" % (
+                n, " - candidates: " + ", ".join(cands) if cands else ""))
+    os.makedirs(os.path.join(dest, "profiles"), exist_ok=True)
+    os.makedirs(os.path.join(dest, "tests"), exist_ok=True)
+    workdir = "$SCRATCH/hpctest, ~/hpctest-runs" if os.environ.get("SCRATCH") else "~/hpctest-runs"
+    with open(os.path.join(dest, "site.conf"), "w") as fh:
+        fh.write(SITE_TEMPLATE.format(
+            name=name, date=datetime.date.today(), host=host,
+            match="^" + re.sub(r"\d+$", "", host), workdir=workdir, init=init, purge=purge,
+            gpu_partition=gpu_part, arches=" ".join(sorted(arches)),
+            gpu_models=" ".join(sorted(gpu_models)),
+            aliases="\n".join(alias_lines),
+            params="\n".join("# %s = %s" % kv for kv in sorted(params.items()))))
+    for f, text in (("baselines.conf",
+                     "# Benchmark baselines. Fill with: hpctest calibrate -p benchmarks -r 3\n"),
+                    ("smoke.conf",
+                     "# Smoke commands for 'hpctest modules': module (or module/version) = cmd\n"
+                     "[smoke]\n# samtools = samtools --version\n")):
+        p = os.path.join(dest, f)
+        if not os.path.exists(p):
+            with open(p, "w") as fh:
+                fh.write(text)
+    nf = sum(1 for l in alias_lines if "NOT FOUND" in l)
+    print("\nWrote %s/site.conf  (%d of %d module names not found)" % (dest, nf, len(names)))
+    print("Next steps (docs/PORTING.md):\n"
+          "  1. edit %s/site.conf\n"
+          "  2. export HPCTEST_SITE=%s; hpctest check\n"
+          "  3. hpctest run -p quick\n"
+          "  4. hpctest calibrate -p benchmarks -r 3" % (dest, name))
+    return 0
+
+
+# ==========================================================================
+# new / bless
+# ==========================================================================
+
+NEW_TEST = """#!/bin/bash
+#@ description: {name}: one line saying what this checks
+#@ modules: {modules}
+#@ nodes: 1
+#@ ntasks: 1
+#@ time: 5
+#@ tags: app
+#
+# Runs inside the job, in a copy of this directory, after the modules are loaded.
+{command}
+"""
+
+
+def cmd_new(args):
+    site = detect_site(args.site)
+    root = os.path.join(site.dir, "tests") if args.site_only and site.dir else TESTS_DIR
+    dest = os.path.join(root, args.name)
+    if os.path.exists(dest):
+        die("%s already exists" % dest)
+    os.makedirs(dest)
+    with open(os.path.join(dest, "test.sh"), "w") as fh:
+        fh.write(NEW_TEST.format(name=args.name, modules=" ".join(args.module or []),
+                                 command=args.command or "echo 'replace me'"))
+    open(os.path.join(dest, "expected.out"), "w").close()
+    print("Created %s\nNext:\n"
+          "  hpctest run %s --keep           (or --local inside an allocation)\n"
+          "  hpctest bless <run-dir>/%s      (copies the real output into expected.out/.err)\n"
+          "  edit expected.out: hosts, times, paths -> ${*}; numbers to track -> ${NAME}"
+          % (dest, args.name, args.name))
+    return 0
+
+
+def cmd_bless(args):
+    d = os.path.abspath(args.testdir)
+    manifest = load_manifest(os.path.dirname(d))
+    job = next((j for j in manifest["jobs"] if os.path.abspath(j["dir"]) == d), None) or \
+        die("%s is not a test directory of that run" % d)
+    t = discover(detect_site(manifest.get("site") or "none")).get(job["test"]) or \
+        die("test %s not found" % job["test"])
+    for actual, expected in (("job.out", "expected.out"), ("job.err", "expected.err")):
+        lines = clean_output(read_lines(os.path.join(d, actual)))
+        target = t.file(expected)
+        if expected == "expected.err" and not lines:
+            if os.path.exists(target):
+                os.remove(target)
+            continue
+        with open(target, "w") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
+        print("updated %s (%d lines)" % (target, len(lines)))
+    print("Now replace run-specific text (hosts, timings, paths) with ${*}.")
+    return 0
+
+
+# ==========================================================================
+# CLI
+# ==========================================================================
+
+EPILOG = """
+everyday use:
+  hpctest list                          tests, resources, module names used at this site
+  hpctest check                         can each test's modules load? (fast, no jobs)
+  hpctest run -p quick                  smoke test (also: default, full, benchmarks, ...)
+  hpctest run mpi_hello tag:gpu 'r_*'   names, tags, wildcards
+  hpctest run mpi_hello --set mpi=mvapich2      try another module or parameter
+  hpctest run --all --no-wait           then: hpctest report <run-dir>
+  hpctest modules                       load every module in the catalog
+  hpctest modules --with gcc openmpi    ... including those behind gcc + openmpi
+
+new cluster (docs/PORTING.md):
+  hpctest site init <name>              probe scheduler + modules, write sites/<name>/
+  hpctest check; hpctest run -p quick   adjust [aliases] / [disabled] until clean
+  hpctest calibrate -p benchmarks -r 3  record benchmark baselines
+
+statuses:
+""" + "\n".join("  %-8s %s" % kv for kv in STATUS_HELP)
+
+
+def main(argv=None):
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    sbatch_extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, sbatch_extra = argv[:i], argv[i + 1:]
+
+    ap = argparse.ArgumentParser(prog="hpctest", epilog=EPILOG,
+                                 description="Portable HPC module and scheduler health tests.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version="hpctest " + VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def sitearg(p):
+        p.add_argument("--site", help="site name (default: $HPCTEST_SITE, else hostname match)")
+
+    def selection(p):
+        p.add_argument("tests", nargs="*", help="test names, wildcards, or tag:<tag>")
+        p.add_argument("-p", "--profile", action="append", help="profile (repeatable)")
+        p.add_argument("--all", action="store_true", help="every test")
+        p.add_argument("--set", action="append", metavar="PARAM=VALUE",
+                       help="override a test parameter, e.g. mpi=mvapich2 (repeatable)")
+        p.add_argument("-j", "--jobs", type=int, default=8, help="parallel local workers")
+        p.add_argument("-q", "--quiet", action="store_true")
+
+    def runopts(p):
+        p.add_argument("-r", "--repeat", type=int, help="run each test N times")
+        p.add_argument("--need", type=int, help="with -r: passes needed (default: all)")
+        p.add_argument("--workdir", help="where run directories go (default: site.conf)")
+        p.add_argument("--timeout", type=int, default=120, help="minutes to wait (120)")
+        p.add_argument("--cancel-on-timeout", action="store_true")
+        p.add_argument("-n", "--nodes", action="store_true", help="list nodes with failures")
+        p.add_argument("--syslog", action="store_true", help="log results with logger(1)")
+
+    p = sub.add_parser("list", help="list tests")
+    sitearg(p)
+    p.add_argument("-p", "--profile", action="append")
+    p.add_argument("-t", "--tag")
+    p.add_argument("--names", action="store_true", help="names only")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("profiles", help="list profiles")
+    sitearg(p)
+    p.set_defaults(func=cmd_profiles)
+
+    p = sub.add_parser("show", help="show a test as it will run at this site")
+    sitearg(p)
+    p.add_argument("tests", nargs="+")
+    p.add_argument("--set", action="append", metavar="PARAM=VALUE")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("check", help="check that test modules load (no jobs)")
+    sitearg(p)
+    selection(p)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("run", help="run tests as scheduler jobs (or --local)")
+    sitearg(p)
+    selection(p)
+    runopts(p)
+    p.add_argument("--local", action="store_true", help="run here, inside your allocation")
+    p.add_argument("--no-wait", action="store_true", help="submit and exit")
+    p.add_argument("-k", "--keep", action="store_true", help="keep passing test directories")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("report", help="(re)check a run directory")
+    sitearg(p)
+    p.add_argument("rundir")
+    p.add_argument("--recheck", action="store_true",
+                   help="re-verify finished jobs against current baselines")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("-k", "--keep", action="store_true")
+    p.add_argument("-n", "--nodes", action="store_true")
+    p.add_argument("--syslog", action="store_true")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("modules", help="load every module in the catalog, report failures")
+    sitearg(p)
+    p.add_argument("patterns", nargs="*", help="only modules matching these globs")
+    p.add_argument("--with", dest="with_", nargs="+", metavar="MODULE",
+                   help="load these first and sweep the modules they make visible")
+    p.add_argument("-j", "--jobs", type=int, default=8)
+    p.add_argument("--smoke-timeout", type=int, default=60, help="seconds per smoke command")
+    p.add_argument("-o", "--output", help="also write a TSV report")
+    p.add_argument("-v", "--verbose", action="store_true", help="also list modules that pass")
+    p.set_defaults(func=cmd_modules)
+
+    p = sub.add_parser("calibrate", help="run benchmarks and record this site's baselines")
+    sitearg(p)
+    selection(p)
+    runopts(p)
+    p.add_argument("--tolerance", default="-25,50",
+                   help="low,high %% for new entries (default -25,50)")
+    p.add_argument("--no-arch", action="store_true", help="one baseline for all node types")
+    p.add_argument("--dry-run", action="store_true", help="print, do not write")
+    p.add_argument("--from", dest="from_", nargs="+", metavar="RUNDIR",
+                   help="use finished run directories instead of running tests")
+    p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser("site", help="site config: list | show [name] | init <name>")
+    sitearg(p)
+    p.add_argument("action", choices=["list", "show", "init"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_site)
+
+    p = sub.add_parser("new", help="create a test skeleton")
+    sitearg(p)
+    p.add_argument("name")
+    p.add_argument("-m", "--module", action="append", help="portable module name (repeatable)")
+    p.add_argument("-c", "--command", help="command for test.sh")
+    p.add_argument("--site-only", action="store_true", help="create under sites/<site>/tests")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("bless", help="copy a kept run's output into the test's expected files")
+    p.add_argument("testdir")
+    p.set_defaults(func=cmd_bless)
+
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        return 2
+    args.sbatch = sbatch_extra
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

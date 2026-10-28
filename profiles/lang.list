@@ -1,0 +1,11 @@
+# Languages and interactive environments (MATLAB/Mathematica also check licenses)
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+python_hello
+python_numpy
+r_hello
+julia_hello
+octave_hello
+matlab_hello
+mathematica_hello
+sqlite

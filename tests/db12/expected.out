@@ -1,0 +1,2 @@
+Result from DIRAC benchmark: ${*}
+DIRAC per core: ${DIRAC}

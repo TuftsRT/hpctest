@@ -1,0 +1,49 @@
+Running NumPy Tests...
+
+1. Array Creation
+Array a: [1 2 3]
+Array b (zeros):
+ [[0. 0.]
+ [0. 0.]]
+Array c (ones):
+ [[1. 1.]
+ [1. 1.]]
+Array d (identity matrix):
+ [[1. 0. 0.]
+ [0. 1. 0.]
+ [0. 0. 1.]]
+Array creation tests passed.
+
+2. Basic Operations
+Array x: [1 2 3]
+Array y: [4 5 6]
+x + y: [5 7 9]
+x * y: [ 4 10 18]
+x - y: [-3 -3 -3]
+x / y: [0.25 0.4  0.5 ]
+Basic operations tests passed.
+
+3. Statistical Functions
+Array stats: [1 2 3 4 5]
+Mean: 3.0
+Sum: 15
+Standard Deviation: 1.4142135623730951
+Statistical functions tests passed.
+
+4. Linear Algebra
+Matrix1:
+ [[1 2]
+ [3 4]]
+Matrix2:
+ [[2 0]
+ [1 2]]
+Dot product:
+ [[ 4  4]
+ [10  8]]
+Determinant of matrix1: -2.0000000000000004
+Inverse of matrix1:
+ [[-2.   1. ]
+ [ 1.5 -0.5]]
+Linear algebra tests passed.
+
+All NumPy tests passed successfully!

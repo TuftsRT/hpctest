@@ -1,0 +1,2 @@
+Hello from Fortran
+sum 1..100 =  5050.0

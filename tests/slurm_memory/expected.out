@@ -1,0 +1,2 @@
+cgroup v${*}
+cgroup memory limit: 2000 MB

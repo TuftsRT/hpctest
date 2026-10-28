@@ -1,0 +1,9 @@
+# Scheduler and node configuration: cgroups, OOM handling, exclusive, multi-node
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+slurm_cpuset x2
+slurm_memory x2
+slurm_oom
+slurm_exclusive
+slurm_multinode
+slurm_node_config x4

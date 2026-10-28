@@ -1,0 +1,8 @@
+# GPU tests
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+cuda_vector_add
+gromacs
+pytorch_gpu
+tensorflow_gpu
+gpu_bench

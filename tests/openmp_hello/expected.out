@@ -1,0 +1,4 @@
+SERIAL REGION:     Thread:0 of 1 thread    hello, world
+PARALLEL REGION:   Thread:${*} of 2 threads   hello, world
+PARALLEL REGION:   Thread:${*} of 2 threads   hello, world
+SERIAL REGION:     Thread:0 of 1 thread    hello, world

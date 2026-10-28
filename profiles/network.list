@@ -1,0 +1,10 @@
+# OSU MPI micro-benchmarks (2-8 nodes, one at a time); needs site baselines
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+osu_latency serial
+osu_bw serial
+osu_bibw serial
+osu_allreduce serial
+osu_alltoall serial
+osu_bcast serial
+osu_scatter serial

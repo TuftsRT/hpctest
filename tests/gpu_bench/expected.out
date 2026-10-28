@@ -1,0 +1,6 @@
+device: ${*}
+triad_GBps ${triad_GBps}
+h2d_GBps ${h2d_GBps}
+d2h_GBps ${d2h_GBps}
+sgemm_TFLOPS ${sgemm_TFLOPS}
+fp16_gemm_TFLOPS ${fp16_gemm_TFLOPS}

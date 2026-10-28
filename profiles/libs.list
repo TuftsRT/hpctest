@@ -1,0 +1,10 @@
+# Numerical and I/O libraries
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+fftw
+gsl
+hdf5
+netcdf_c
+netcdf_fortran
+openblas
+boost

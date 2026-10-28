@@ -1,0 +1,22 @@
+# GPU software and GPU benchmark on every GPU model in the gpu partition (Tufts-specific)
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+cuda_vector_add as=cuda_vector_add:a100 -- --constraint=a100
+gpu_bench as=gpu_bench:a100 -- --constraint=a100
+pytorch_gpu as=pytorch_gpu:a100 -- --constraint=a100
+tensorflow_gpu as=tensorflow_gpu:a100 -- --constraint=a100
+cuda_vector_add as=cuda_vector_add:h100 -- --constraint=h100
+gpu_bench as=gpu_bench:h100 -- --constraint=h100
+pytorch_gpu as=pytorch_gpu:h100 -- --constraint=h100
+tensorflow_gpu as=tensorflow_gpu:h100 -- --constraint=h100
+cuda_vector_add as=cuda_vector_add:h200 -- --constraint=h200
+gpu_bench as=gpu_bench:h200 -- --constraint=h200
+pytorch_gpu as=pytorch_gpu:h200 -- --constraint=h200
+tensorflow_gpu as=tensorflow_gpu:h200 -- --constraint=h200
+cuda_vector_add as=cuda_vector_add:l40s -- --constraint=l40s
+gpu_bench as=gpu_bench:l40s -- --constraint=l40s
+pytorch_gpu as=pytorch_gpu:l40s -- --constraint=l40s
+tensorflow_gpu as=tensorflow_gpu:l40s -- --constraint=l40s
+cuda_vector_add as=cuda_vector_add:rtx_pro_6000 -- --constraint=rtx_pro_6000
+gpu_bench as=gpu_bench:rtx_pro_6000 -- --constraint=rtx_pro_6000
+pytorch_gpu as=pytorch_gpu:rtx_pro_6000 -- --constraint=rtx_pro_6000
+tensorflow_gpu as=tensorflow_gpu:rtx_pro_6000 -- --constraint=rtx_pro_6000

@@ -1,0 +1,9 @@
+# Single-node performance (exclusive nodes, one at a time); needs site baselines
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+stream serial
+db12 serial
+linpack_mkl serial
+hpcg_mkl serial
+r_benchmark serial
+io_fio serial

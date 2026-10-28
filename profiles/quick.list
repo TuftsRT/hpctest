@@ -1,0 +1,11 @@
+# Quick smoke test (~5 min): compiler, OpenMP, MPI, Python, R, SQLite, cgroups
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+c_hello
+openmp_hello
+mpi_hello
+python_hello
+r_hello
+sqlite
+slurm_cpuset
+slurm_memory

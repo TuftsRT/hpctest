@@ -1,0 +1,2 @@
+GPUs are available: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')${*}
+Matrix multiplication result shape: (1000, 1000)
