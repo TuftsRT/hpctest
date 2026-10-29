@@ -18,8 +18,6 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
   libraries, languages, applications, GPUs (single, multi-GPU, multi-node), containers,
   Slurm/cgroups, node health, and CPU/GPU/network/file-system benchmarks.
 
-Version 1.0.0 · MIT license
-
 ---
 
 ## Contents
