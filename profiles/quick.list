@@ -9,3 +9,4 @@ r_hello
 sqlite
 slurm_cpuset
 slurm_memory
+node_health

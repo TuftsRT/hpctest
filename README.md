@@ -14,8 +14,8 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
   `sites/<name>/` directory that `hpctest site init` drafts for you.
 - **Clear failures.** Every result is classified (MODULE, BUILD, FAIL, PERF, JOB, …) and
   shown with the evidence: the first mismatching line, the build log, the module error.
-- **50 tests** covering compilers, MPI, numerical/I-O libraries, languages, applications,
-  GPUs, Slurm/cgroups, and CPU/GPU/network/file-system benchmarks.
+- **63 tests** covering compilers, MPI, numerical/I-O libraries, languages, applications,
+  GPUs, containers, Slurm/cgroups, node health, and CPU/GPU/network/file-system benchmarks.
 
 Version 1.0.0 · MIT license
 
@@ -44,6 +44,8 @@ Version 1.0.0 · MIT license
 - Lmod, or Environment Modules 4+
 - bash and Python 3.6 or newer
 - A file system shared by the submit host and the compute nodes (for run directories)
+- Optional, for the tests that use them: Apptainer/Singularity, NVIDIA GPUs (CUDA, NCCL),
+  `ibstat` (infiniband-diags) for `node_rdma`
 
 Individual tests need the software they test (`gcc`, `openmpi`, `fio`, …). Tests whose
 software a site doesn't have are disabled in that site's config and reported as SKIP.
@@ -219,8 +221,10 @@ Useful `run` options:
 | Libraries | `fftw`, `gsl`, `hdf5`, `netcdf_c`, `netcdf_fortran`, `openblas`, `boost` |
 | Languages | `python_hello`, `python_numpy`, `r_hello`, `julia_hello`, `octave_hello`, `matlab_hello`, `mathematica_hello`, `sqlite` |
 | Applications | `blast`, `hmmer`, `quantum_espresso`, `gromacs`, `gnuplot`, `pytorch_cpu`, `pytorch_gpu`, `tensorflow_cpu`, `tensorflow_gpu` |
-| Scheduler and nodes | `slurm_cpuset`, `slurm_memory`, `slurm_oom`, `slurm_exclusive`, `slurm_multinode`, `slurm_node_config` |
-| Benchmarks | `stream`, `linpack_mkl`, `hpcg_mkl`, `db12`, `r_benchmark`, `io_fio`, `gpu_bench`, `osu_latency`, `osu_bw`, `osu_bibw`, `osu_allreduce`, `osu_alltoall`, `osu_bcast`, `osu_scatter` |
+| Scheduler | `slurm_cpuset`, `slurm_memory`, `slurm_oom`, `slurm_exclusive`, `slurm_multinode`, `slurm_timeout`, `slurm_array`, `slurm_dependency`, `slurm_accounting`, `slurm_srun_mpi` |
+| Node health | `node_health`, `node_rdma`, `slurm_node_config`, `gpu_health`, `gpu_isolation` |
+| Containers | `apptainer`, `apptainer_gpu`, `apptainer_mpi` |
+| Benchmarks | `stream`, `linpack_mkl`, `hpcg_mkl`, `db12`, `r_benchmark`, `io_fio`, `gpu_bench`, `nccl_allreduce`, `osu_latency`, `osu_bw`, `osu_bibw`, `osu_allreduce`, `osu_alltoall`, `osu_bcast`, `osu_scatter` |
 
 `hpctest list` shows them all with descriptions; `hpctest show TEST` shows one in full.
 
@@ -228,17 +232,19 @@ Useful `run` options:
 
 | Profile | Contents |
 |---------|----------|
-| `quick` | C, OpenMP, MPI, Python, R, SQLite, cgroup CPU and memory limits |
-| `scheduler` | cgroups, OOM kill, exclusive allocation, multi-node `srun`, node hardware vs. Slurm config |
+| `quick` | C, OpenMP, MPI, Python, R, SQLite, cgroup CPU and memory limits, node basics |
+| `scheduler` | cgroups, OOM kill, exclusive allocation, multi-node `srun`, node hardware vs. Slurm config, step time limits, job arrays, dependencies, `sacct` accounting, `srun --mpi` launch |
+| `node` | clock sync, user/group lookup, DNS, `/tmp` space, file systems, RDMA ports, hardware vs. Slurm config |
+| `containers` | Apptainer: image pull, user, bind mounts, exit codes; MPI inside a container |
 | `compilers` | GCC and Intel oneAPI (C, Fortran, OpenMP), CUDA |
 | `mpi` | OpenMPI and MVAPICH2 with GCC and oneAPI, Intel MPI, PnetCDF |
 | `libs` | FFTW, GSL, HDF5, netCDF-C/Fortran, OpenBLAS, Boost |
 | `lang` | Python, NumPy, R, Julia, Octave, MATLAB, Mathematica, SQLite |
 | `apps` | BLAST+, HMMER, Quantum ESPRESSO, gnuplot, PyTorch and TensorFlow (CPU) |
-| `gpu` | CUDA, GROMACS, PyTorch, TensorFlow, GPU benchmark |
+| `gpu` | CUDA, GROMACS, PyTorch, TensorFlow, GPU benchmark, GPU isolation and health, NCCL, Apptainer `--nv` |
 | `benchmarks` | STREAM, LINPACK, HPCG, DB12, R-benchmark-25, fio |
 | `network` | OSU latency, bandwidth, bi-bandwidth, allreduce, alltoall, bcast, scatter |
-| `default` | scheduler + compilers + mpi + libs + lang + apps |
+| `default` | scheduler + node + compilers + mpi + libs + lang + apps + containers |
 | `full` | default + gpu + benchmarks + network |
 
 Sites add their own; for example, `sites/tufts/profiles/gpu-types.list` runs the GPU
@@ -255,6 +261,7 @@ tests once on every GPU model in the cluster.
 | `r_benchmark` | R + BLAS runtime (R-benchmark-25) |
 | `io_fio` | file system: sequential write/read MB/s, 4k random-read IOPS (direct I/O) |
 | `gpu_bench` | GPU memory bandwidth, host↔device GB/s, FP32 and FP16 tensor-core GEMM TFLOPS |
+| `nccl_allreduce` | NCCL all-reduce bus bandwidth across 2 GPUs of one node (GB/s) |
 | `osu_*` | MPI point-to-point and collective latency/bandwidth |
 
 Numbers are captured from the output and compared with the site's `baselines.conf`:
@@ -292,6 +299,22 @@ the tests use that `module avail` can't find, with candidate matches.
 **[docs/PORTING.md](docs/PORTING.md)** walks through it, including EasyBuild naming,
 MPI launchers, per-user limits and cron setup.
 
+A few tests need site values in `[params]` (`hpctest show <test>` lists a test's params):
+
+| Param | Test | Example |
+|-------|------|---------|
+| `fs_paths`, `fs_write` | `node_health` | shared file systems that must be mounted / writable |
+| `rdma_rate`, `rdma_min_ports` | `node_rdma` | `100` (Gb/s), `1` |
+| `image`, `bind_paths` | `apptainer`, `apptainer_gpu` | a local `.sif` if compute nodes can't reach Docker Hub |
+| `mpi_image`, `srun_mpi` | `apptainer_mpi` | a `.sif` with an MPI built for PMIx or PMI-2 |
+
+Node problems usually affect one node, not a whole partition, so run the `node` profile
+on each node:
+
+```bash
+for n in $(sinfo -h -N -p batch -o %N | sort -u); do hpctest run -p node --no-wait -- -w $n; done
+```
+
 ## Writing tests
 
 ```bash
@@ -314,6 +337,7 @@ sites/template/          annotated site.conf
 sites/tufts/             example: Tufts University HPC
 docs/PORTING.md          adopting hpctest at a new site
 docs/WRITING_TESTS.md    test format reference
+selftest/                offline tests of bin/hpctest (no Slurm needed)
 third_party/             licenses of bundled third-party code
 CHANGELOG.md
 ```
@@ -328,6 +352,7 @@ module-system support, and site configs that others can learn from.
 - A new test should declare site-dependent inputs as `#@ param` (plus
   `#@ requires-param` when there is no sensible default) and use portable module names.
 - Run `hpctest run <your test>` at least once on a real cluster before submitting.
+- If you change `bin/hpctest`, run `python3 -m unittest discover -s selftest`.
 
 ## License
 

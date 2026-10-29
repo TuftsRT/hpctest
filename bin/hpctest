@@ -19,6 +19,7 @@ import concurrent.futures
 import configparser
 import datetime
 import fnmatch
+import getpass
 import json
 import os
 import random
@@ -41,6 +42,8 @@ SITES_DIR = os.path.join(ROOT, "sites")
 META = ".hpctest"
 JOB_PREFIX = "hpctest-"
 POLL_SECONDS = 15
+# A job that left the queue may not show its files on this host yet (NFS attribute cache).
+FS_GRACE_SECONDS = 90
 
 STATUS_HELP = [
     ("PASS", "output, exit code and benchmark values as expected"),
@@ -578,9 +581,14 @@ def verify(job, site):
     want = job.get("exit_code", "0")
     if rc and want != "any" and rc[0] != want:
         return "FAIL", "test.sh exit code %s (expected %s)" % (rc[0], want), notes
+    return compare_baselines(job, site, notes)
+
+
+def compare_baselines(job, site, notes):
+    """Check job["values"] against baselines.conf. Returns (status, detail, notes)."""
+    caps = job.get("values") or {}
     if not caps:
         return "PASS", "", notes
-
     ranges, section = baselines_for(site, [job["id"], job["test"]], job.get("arch"))
     if not ranges:
         return "PASS", "no baseline for %s yet: %s" % (
@@ -735,7 +743,12 @@ def submit(job, script, extra, serial):
            "-e", os.path.join(job["dir"], "job.err")]
     if serial:
         cmd.append("--dependency=singleton")
-    r = run_cmd(cmd + extra + [script])
+    # sbatch exports our environment; when hpctest runs inside an allocation, that job's
+    # SLURM_* settings (SLURM_MEM_PER_NODE, SLURM_TRES_PER_TASK, ...) would clash with the
+    # test job's own and make every srun in it fail. SBATCH_* defaults are kept.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("SLURM_") or k == "SLURM_CONF"}
+    r = run_cmd(cmd + extra + [script], env=env)
     if r.returncode != 0:
         msg = r.stderr.strip().splitlines()
         job.update(status="SUBMIT", detail=msg[-1] if msg else "sbatch exit %d" % r.returncode,
@@ -748,7 +761,7 @@ QUEUE_REASON = {}
 
 
 def queued_jobs(ids):
-    r = run_cmd(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i %T %r"])
+    r = run_cmd(["squeue", "-h", "-u", getpass.getuser(), "-o", "%i %T %r"])
     if r.returncode != 0:
         return None
     state = {}
@@ -905,6 +918,9 @@ def cmd_run(args, site=None):
     tests = discover(site)
     entries = build_entries(args, site, tests)
     cli_params = parse_set(args.set)
+    declared = {k for e in entries for k in tests[e.test].params}
+    for k in sorted(set(cli_params) - declared):
+        warn("--set %s: no selected test has a parameter '%s' (see 'hpctest show')" % (k, k))
     extra = list(args.sbatch or [])
     if args.local:
         guard_allocation(site, "run --local")
@@ -948,10 +964,13 @@ def run_local(jobs, tests, site, args):
         limit = j["time_limit"] * 60
         with open(os.path.join(j["dir"], "job.out"), "w") as out, \
                 open(os.path.join(j["dir"], "job.err"), "w") as err:
+            proc = subprocess.Popen(["bash", script], stdout=out, stderr=err, cwd=j["dir"],
+                                    start_new_session=True)
             try:
-                subprocess.run(["bash", script], stdout=out, stderr=err, cwd=j["dir"],
-                               timeout=limit, start_new_session=True)
+                proc.wait(timeout=limit)
             except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)   # also mpirun, compilers, ...
+                proc.wait()
                 j.update(status="JOB", detail="timed out after %d min" % (limit // 60),
                          done=True)
                 return j
@@ -959,11 +978,21 @@ def run_local(jobs, tests, site, args):
         j.update(status=status, detail=detail, notes=notes, done=True)
         return j
 
+    def show(j):
+        if not args.quiet:
+            print("  %-8s %s%s" % (color(j["status"]), j["id"],
+                                   " (%s)" % j["detail"] if j["detail"] else ""))
+
+    # Serial and whole-node tests would disturb each other (and their numbers) in one
+    # allocation, so they run one at a time after the rest.
+    alone, shared = [], []
+    for j in jobs:
+        (alone if j["serial"] or tests[j["test"]].exclusive else shared).append(j)
     with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
-        for j in pool.map(one, jobs):
-            if not args.quiet:
-                print("  %-8s %s%s" % (color(j["status"]), j["id"],
-                                       " (%s)" % j["detail"] if j["detail"] else ""))
+        for j in pool.map(one, shared):
+            show(j)
+    for j in alone:
+        show(one(j))
 
 
 def wait_for_jobs(jobs, site, manifest, args):
@@ -982,15 +1011,23 @@ def wait_for_jobs(jobs, site, manifest, args):
     signal.signal(signal.SIGINT, cancel)
     signal.signal(signal.SIGTERM, cancel)
     tty = sys.stdout.isatty() and not args.quiet
+    gone = {}                                  # jobid -> when it was first seen out of the queue
     while pending:
         time.sleep(3 if tty and len(pending) < 3 else POLL_SECONDS)
         queue = queued_jobs(set(pending))
         if queue is None:
-            continue
-        finished = [i for i in pending if i not in queue]
+            queue = {}
+            finished = []                      # squeue failed: try again next poll
+        else:
+            finished = [i for i in pending if i not in queue]
         acct = sacct_states(finished)
+        now = time.time()
         for i in finished:
-            j = pending.pop(i)
+            j = pending[i]
+            if not os.path.exists(os.path.join(j["dir"], META, "done")) and \
+                    now - gone.setdefault(i, now) < FS_GRACE_SECONDS:
+                continue
+            del pending[i]
             status, detail, notes = evaluate(j, site, acct.get(i))
             if status == "PENDING":
                 status, detail = "JOB", "job left the queue without finishing"
@@ -1142,7 +1179,11 @@ def cmd_report(args):
     acct = sacct_states([i for i in open_ids if i not in queue])
     for j in jobs:
         recheck = args.recheck and j.get("status") in ("PASS", "FAIL", "PERF")
-        if (j.get("status") in (None, "PENDING") or recheck) and os.path.isdir(j["dir"]):
+        if recheck and not os.path.isdir(j["dir"]) and j.get("values"):
+            # Passing directories are removed, but their numbers are in the manifest.
+            s, d, n = compare_baselines(j, site, [])
+            j.update(status=s, detail=d, notes=n)
+        elif (j.get("status") in (None, "PENDING") or recheck) and os.path.isdir(j["dir"]):
             if j.get("jobid") in queue:
                 j.update(status="PENDING", detail="job %s %s" % (j["jobid"], queue[j["jobid"]]))
             else:
@@ -1349,7 +1390,8 @@ def cmd_modules(args):
     preload = site.resolve_modules(args.with_ or [])
     mods = module_catalog(site, preload)
     if preload:
-        mods = [m for m in mods if m not in module_catalog(site, [])]
+        base = set(module_catalog(site, []))
+        mods = [m for m in mods if m not in base]
     if args.patterns:
         mods = [m for m in mods if any(fnmatch.fnmatch(m, p) or fnmatch.fnmatch(m.split("/")[0], p)
                                        for p in args.patterns)]
@@ -1424,10 +1466,9 @@ def cmd_calibrate(args):
     path = os.path.join(site.dir, "baselines.conf")
     cp = read_baselines(site)
     low, high = [float(x) for x in args.tolerance.split(",")]
+    updates = {}
     print("\nMeasured (median of passing runs):")
     for sec, vals in sorted(samples.items()):
-        if not cp.has_section(sec):
-            cp.add_section(sec)
         base = sec.split("@")[0]
         for k, vs in sorted(vals.items()):
             med = statistics.median(vs)
@@ -1439,21 +1480,52 @@ def cmd_calibrate(args):
                     except (ValueError, IndexError):
                         pass
                     break
-            cp.set(sec, k, "%.4g %g %g %g" % (med, lo, hi, w))
+            updates.setdefault(sec, {})[k] = "%.4g %g %g %g" % (med, lo, hi, w)
             print("  [%s] %s = %.4g   (n=%d, range %.4g..%.4g)" % (sec, k, med, len(vs),
                                                                     min(vs), max(vs)))
     if args.dry_run:
         print("\n--dry-run: %s not changed" % path)
         return 0
-    header = [l for l in read_lines(path) if l.startswith("#")] or [
+    header = [
         "# Benchmark baselines for site %s." % site.name,
-        "# NAME = expected low%% high%% [weight]   (weight < 0: lower is better)",
+        "# NAME = expected low% high% [weight]   (weight < 0: lower is better)",
         "# Sections: [test] or [test@arch]. Written by 'hpctest calibrate'; edit freely."]
-    with open(path, "w") as fh:
-        fh.write("\n".join(header) + "\n\n")
-        cp.write(fh)
+    update_conf(path, updates, header)
     print("\nUpdated %s" % path)
     return 0
+
+
+def update_conf(path, updates, header):
+    """Set [section] key = value in an INI file, keeping its comments and layout."""
+    lines = read_lines(path) or header
+    todo = {s: dict(kv) for s, kv in updates.items()}
+    out, sec = [], None
+
+    def add_missing():
+        rest = todo.pop(sec, None) if sec else None
+        if rest:
+            at = len(out)
+            while at and not out[at - 1].strip():
+                at -= 1
+            out[at:at] = ["%s = %s" % kv for kv in rest.items()]
+
+    for line in lines:
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            add_missing()
+            sec = m.group(1).strip()
+        elif sec in todo:
+            k = re.match(r"\s*([^#;\s][^=]*?)\s*=", line)
+            if k and k.group(1) in todo[sec]:
+                comment = re.search(r"\s+#.*$", line)
+                line = "%s = %s%s" % (k.group(1), todo[sec].pop(k.group(1)),
+                                      comment.group(0) if comment else "")
+        out.append(line)
+    add_missing()
+    for s, kv in todo.items():
+        out += ["", "[%s]" % s] + ["%s = %s" % x for x in kv.items()]
+    with open(path, "w") as fh:
+        fh.write("\n".join(out) + "\n")
 
 
 # ==========================================================================
@@ -1705,6 +1777,9 @@ def main(argv=None):
     if "--" in argv:
         i = argv.index("--")
         argv, sbatch_extra = argv[:i], argv[i + 1:]
+    if "--tolerance" in argv[:-1]:            # its value starts with "-" (e.g. -25,50)
+        i = argv.index("--tolerance")
+        argv[i:i + 2] = ["--tolerance=" + argv[i + 1]]
 
     ap = argparse.ArgumentParser(prog="hpctest", epilog=EPILOG,
                                  description="Portable HPC module and scheduler health tests.",

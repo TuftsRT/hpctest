@@ -1,0 +1,8 @@
+# Node health: clock, users, DNS, /tmp, file systems, RDMA ports, hardware vs. Slurm
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+# Run it on every node to find the one bad node, e.g.
+#   for n in $(sinfo -h -N -p batch -o %N | sort -u); do hpctest run -p node --no-wait -- -w $n; done
+node_health
+node_rdma
+slurm_node_config

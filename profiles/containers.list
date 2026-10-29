@@ -1,0 +1,5 @@
+# Containers: Apptainer basics and MPI inside a container (GPU: see gpu)
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+apptainer
+apptainer_mpi

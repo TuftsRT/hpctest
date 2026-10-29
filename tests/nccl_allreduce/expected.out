@@ -1,0 +1,2 @@
+allreduce sum: ok
+busbw_GBps ${busbw_GBps}

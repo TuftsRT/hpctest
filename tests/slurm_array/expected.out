@@ -1,0 +1,2 @@
+task outputs: 1 2 3
+sacct: 3 COMPLETED

@@ -1,0 +1,3 @@
+B ran after A finished: yes
+job depending on a failed job ran: no
+sacct A B failed dependent: COMPLETED COMPLETED FAILED CANCELLED

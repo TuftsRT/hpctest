@@ -6,3 +6,7 @@ gromacs
 pytorch_gpu
 tensorflow_gpu
 gpu_bench
+gpu_isolation
+gpu_health
+nccl_allreduce
+apptainer_gpu

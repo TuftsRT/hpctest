@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES entries: 1
+GPUs nvidia-smi can open: 1
+/dev/nvidia[0-9]* usable: 1

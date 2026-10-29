@@ -1,0 +1,5 @@
+image: ok
+runs: ok
+same user inside: ok
+job directory bind: ok
+exit code passed through: 3
