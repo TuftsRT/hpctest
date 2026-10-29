@@ -63,6 +63,11 @@ There is nothing to build. `hpctest` finds its tests, profiles and site configs
 relative to its own location, so the directory can live anywhere, including a shared
 software tree.
 
+You can also deploy it as a module. To load the module:
+```
+module load hpctest
+hpctest --version
+```
 ## Quick start
 
 At a site that already has a config (or after [adopting it](#adopting-hpctest-at-your-site)):
