@@ -1,2 +1,2 @@
-${*}Number of MPI processes:${*}4
+GPU acceleration: yes
 ${*}Final energy${*}= ${*}-43.10976799${*}

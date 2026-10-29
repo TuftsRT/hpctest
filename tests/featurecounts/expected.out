@@ -1,0 +1,10 @@
+unstranded:
+G1 600 60
+G2 600 40
+G3 600 0
+Assigned	100
+Unassigned_NoFeatures	5
+stranded (-s 1):
+G1 30
+G2 20
+G3 0

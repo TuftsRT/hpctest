@@ -1,0 +1,6 @@
+MPI (4 ranks)
+splits:
+taxC,taxD
+taxC,taxD,taxE,taxF
+taxE,taxF
+tree length 0.6-0.9: yes

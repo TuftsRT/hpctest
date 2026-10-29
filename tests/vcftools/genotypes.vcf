@@ -1,0 +1,12 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=10000>
+##contig=<ID=2,length=10000>
+##FILTER=<ID=LowQ,Description="Low quality">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S1	S2	S3	S4	S5	S6
+1	100	rs1	A	G	50	PASS	.	GT	0/0	0/1	1/1	0/1	0/0	0/0
+1	200	rs2	C	T	50	PASS	.	GT	1/1	1/1	1/1	0/1	1/1	1/1
+1	300	rs3	G	A	50	PASS	.	GT	0/0	0/0	./.	0/0	0/1	0/0
+1	400	rs4	T	C	50	PASS	.	GT	0/1	0/1	0/1	0/1	0/1	0/1
+1	500	rs5	AT	A	50	PASS	.	GT	0/1	0/0	0/0	0/0	0/0	0/0
+2	150	rs6	G	T	5	LowQ	.	GT	0/0	0/0	0/0	0/0	0/1	0/0

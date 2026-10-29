@@ -13,7 +13,7 @@ works, redistributed unmodified or lightly modified for testing, under their own
 | `tests/netcdf_c/simple_xy_wr.c`, `tests/netcdf_fortran/simple_xy_wr.f90` | Unidata netCDF examples | Unidata netCDF license (BSD-style) |
 | `tests/pnetcdf/pnetcdf-write-standard.c` | PnetCDF examples | PnetCDF license (BSD-style) |
 | `tests/hmmer/globins4.*` | HMMER tutorial data | BSD-3-Clause (HMMER) |
-| `tests/quantum_espresso/*.UPF` | Quantum ESPRESSO pseudopotentials | as distributed with Quantum ESPRESSO (GPL) |
+| `tests/quantum_espresso_gpu/*.UPF` | Quantum ESPRESSO pseudopotentials | as distributed with Quantum ESPRESSO (GPL) |
 
 Other test sources (`hello.c`, `mpi_hello.c`, `gpu_bench.cu`, the Boost, GSL, FFTW,
 HDF5, OpenBLAS and Python examples, ...) are part of hpctest under the MIT license

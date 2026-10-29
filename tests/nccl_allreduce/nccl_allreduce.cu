@@ -36,6 +36,7 @@ static void allreduce(std::vector<ncclComm_t> &comms, std::vector<float *> &buf,
 
 int main()
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);     // keep finished lines if a later step hangs
     int ng;
     CK(cudaGetDeviceCount(&ng));
     if (ng < 2) { printf("need at least 2 GPUs, job sees %d\n", ng); return 0; }

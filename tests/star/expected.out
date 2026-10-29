@@ -1,0 +1,10 @@
+Number of input reads: 100
+Uniquely mapped reads number: 100
+Uniquely mapped reads %: 100.00%
+Number of splices: Total: 20
+Number of splices: GT/AG: 20
+Number of reads unmapped: too many mismatches: 0
+% of reads unmapped: too many mismatches: 0.00%
+junctions (chr start end strand motif annotated unique multi):
+chr1	1301	2000	1	1	0	20	0
+reads with N in CIGAR: 20

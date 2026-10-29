@@ -1,0 +1,4 @@
+Invalid write of size 1
+total heap usage: 2 allocs, 1 frees, 56 bytes allocated
+definitely lost: 40 bytes in 1 blocks
+ERROR SUMMARY: 2 errors

@@ -19,23 +19,40 @@ This probes the cluster and writes `sites/mysite/`:
 
 | File | Contents |
 |------|----------|
-| `site.conf` | GPU partition, CPU architecture features from `sinfo`, module init file, and an `[aliases]` section listing every module name the tests use, marking the ones `module avail` cannot find (with candidates) |
+| `site.conf` | GPU partition, CPU architecture features from `sinfo`, module init file, an `[aliases]` section listing every module name the tests use (marking the ones `module avail` cannot find, with candidates), and the detected compiler/MPI settings and `[disabled]` entries (below) |
 | `baselines.conf` | empty; filled by `hpctest calibrate` |
 | `smoke.conf` | optional quick commands for the module catalog sweep |
 | `profiles/`, `tests/` | empty; for site-only additions |
 
 `sites/template/site.conf` documents every key.
 
+Then `site init` loads every test's modules, including the compiler/MPI variants in the
+profiles, as `hpctest check` does (use `--no-probe` to skip this):
+
+- A test whose modules fail to load, or load only with a version swap (a later module
+  replaced `openmpi/5.0.7` with `openmpi/4.1.7`), gets a search over the installed
+  versions of its `compiler` and `mpi` parameters. The search starts with the versions
+  its other modules load by themselves, then the current value, then the newest. The
+  first combination that loads cleanly goes into `[params:<test>]` (or
+  `[params:<test>:<variant>]` for a profile variant), marked `# detected by hpctest`.
+- A test whose module is installed nowhere, or only behind a module level the test has no
+  parameter for, goes under `[disabled]` as "not available".
+- Anything else is reported as NO FIX for you to look at.
+
+Run `hpctest check --fix` to redo this after the module tree changes. It replaces only
+lines marked `# detected by hpctest`. Detection proves that modules load, not that tests
+pass, so finish with a real run (step 4).
+
 ## 2. Map module names
 
 Tests use portable, Spack-style module names (`gcc`, `openmpi`, `intel-oneapi-mkl`,
-`netcdf-c`, `blast-plus`, ...). Map any that differ:
+`netcdf-c`, `blast`, ...). Map any that differ:
 
 ```ini
 [aliases]
 gcc = GCC/12.3.0
 openmpi = OpenMPI/4.1.5-GCC-12.3.0
-blast-plus = BLAST+/2.14.1-gompi-2023a
+blast = BLAST+/2.14.1-gompi-2023a
 ```
 
 A value may list several modules or be empty (load nothing). Then check:
@@ -45,7 +62,8 @@ export HPCTEST_SITE=mysite      # or set [site] match = <hostname regex>
 bin/hpctest check               # loads each test's modules here; no jobs
 ```
 
-Repeat until clean. Software you don't have goes under `[disabled]`:
+Repeat until clean (`hpctest check --fix` handles compiler/MPI choices). Software you
+don't have goes under `[disabled]`:
 
 ```ini
 [disabled]
@@ -53,7 +71,8 @@ mathematica_hello = no license
 ```
 
 If one test needs a different toolchain, override its parameters (any parameter, and
-module parameters can name several modules):
+module parameters can name several modules). `[params:<test>:<variant>]` overrides one
+profile variant, e.g. `[params:mpi_hello:intelmpi]`:
 
 ```ini
 [params:netcdf_c]

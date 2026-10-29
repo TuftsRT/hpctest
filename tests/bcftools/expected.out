@@ -1,0 +1,13 @@
+chr1 records:
+chr1	100	A	G
+chr1	250	C	CAT
+chr1	900	T	A
+chr1	1500	G	C
+QUAL>=40 SNPs:
+chr1	100
+chr1	1500
+chr2	300
+S2 genotypes: 0/0 0/1 0/1 0/1 1/1 
+number of records:	5
+number of SNPs:	4
+number of indels:	1

@@ -1,4 +1,4 @@
-# MPI implementations x compilers, plus parallel I/O
+# MPI implementations x compilers, multi-node data correctness, MPI-IO, hybrid MPI+OpenMP, parallel I/O
 # Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
 #        @profile includes another profile.
 mpi_hello
@@ -7,3 +7,9 @@ mpi_hello compiler=intel-oneapi-compilers mpi=openmpi as=mpi_hello:oneapi+openmp
 mpi_hello compiler=intel-oneapi-compilers mpi=mvapich2 as=mpi_hello:oneapi+mvapich2
 mpi_hello compiler=intel-oneapi-compilers mpi=intel-oneapi-mpi mpicc=mpiicx as=mpi_hello:intelmpi
 pnetcdf
+scalapack
+mpi_collectives
+mpi_collectives compiler=intel-oneapi-compilers mpi=intel-oneapi-mpi mpicc=mpiicx as=mpi_collectives:intelmpi
+mpi_collectives compiler=gcc mpi=mvapich2 as=mpi_collectives:gcc+mvapich2
+mpi_io
+mpi_openmp

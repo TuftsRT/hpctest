@@ -20,6 +20,7 @@ import configparser
 import datetime
 import fnmatch
 import getpass
+import itertools
 import json
 import os
 import random
@@ -407,14 +408,19 @@ def parse_profile(site, name, _seen=None):
     return entries
 
 
-def resolve_params(test, site, entry_params, cli_params):
-    """Test default < site [params] (declared params only) < [params:<test>] < profile < --set."""
+def resolve_params(test, site, entry_params, cli_params, entry_id=None):
+    """
+    Test default < site [params] (declared params only) < [params:<test>] < profile
+    < [params:<entry id>] (one profile variant, e.g. mpi_hello:intelmpi) < --set.
+    """
     p = dict(test.params)
     for k, v in site.section("params").items():
         if k in p:
             p[k] = v
     p.update(site.section("params:" + test.name))
     p.update(entry_params)
+    if entry_id and entry_id != test.name:
+        p.update(site.section("params:" + entry_id))
     p.update(cli_params)
     return p
 
@@ -898,7 +904,7 @@ def make_jobs(entries, tests, site, cli_params, rundir, local):
     jobs = []
     for e in entries:
         t = tests[e.test]
-        params = resolve_params(t, site, e.params, cli_params)
+        params = resolve_params(t, site, e.params, cli_params, e.id)
         why = skip_reason(t, e.id, site, local, params)
         base = re.sub(r"[^\w.+@-]", "_", e.id.replace(":", "@"))
         for r in range(1, e.runs + 1):
@@ -1218,7 +1224,7 @@ def cmd_list(args):
         if not t:
             print("%-*s  %s" % (width, rid, color("FAIL", "<no such test>")))
             continue
-        params = resolve_params(t, site, eparams, {})
+        params = resolve_params(t, site, eparams, {}, rid)
         mods = " ".join(test_modules(t, site, params)) or "-"
         desc = t.description
         if rid in dis or name in dis:
@@ -1269,66 +1275,257 @@ type module >/dev/null 2>&1 || source "$1"
 eval "$2" >/dev/null 2>&1
 shift 2
 failed=""
+seen=""
 for m in "$@"; do
   if module load "$m" >/dev/null 2>&1 && module is-loaded "$m" >/dev/null 2>&1; then :;
   else failed="$failed $m"; fi
+  seen="$seen $(module -t list 2>&1 | tr '\n' ' ')"
 done
 echo "@@FAILED$failed"
+echo "@@SEEN $seen"
 echo "@@LOADED $(module -t list 2>&1 | grep -v ':$' | tr '\n' ' ')"
 """
 
+# Test parameters naming a compiler or MPI module. "check --fix" and "site init" try other
+# installed versions of these when a test's modules do not load cleanly.
+TOOLCHAIN_PARAMS = ("compiler", "mpi")
+MAX_CANDIDATES = 6                 # versions tried per parameter
+AUTO_MARK = "# detected by hpctest"
+
+
+def module_tokens(text):
+    """Module names in "module -t list" output, without headers, markers and messages."""
+    return [t for t in text.split()
+            if "/" in t and not t.startswith(("/", "<")) and not t.endswith(":")]
+
 
 def load_modules_probe(site, modules):
+    """
+    Purge, then load modules in order. Returns (failed, loaded, swapped); swapped lists
+    modules a later load replaced. Lmod swaps versions silently, and "module is-loaded
+    openmpi" stays true after openmpi/5.0.7 became openmpi/4.1.7.
+    """
     r = run_cmd(["bash", "-c", PROBE_SCRIPT, "probe", site.module_init, site.module_purge]
                 + list(modules), timeout=300)
-    failed, loaded = [], []
+    failed, loaded, seen = [], [], ""
     for line in r.stdout.splitlines():
         if line.startswith("@@FAILED"):
             failed = line.split()[1:]
+        elif line.startswith("@@SEEN"):
+            seen = line[6:]
         elif line.startswith("@@LOADED"):
             loaded = line.split()[1:]
-    return failed, loaded
+    swapped = sorted(set(module_tokens(seen)) - set(module_tokens(" ".join(loaded))))
+    return failed, loaded, swapped
 
 
-def cmd_check(args):
-    """Load every selected test's modules on this node (no jobs)."""
-    site = detect_site(args.site)
-    guard_allocation(site, "check")
-    tests = discover(site)
-    entries = build_entries(args, site, tests) if (args.tests or args.profile or args.all) \
-        else [Entry(t) for t in sorted(tests)]
-    cli = parse_set(args.set)
+def all_entries(site, tests):
+    """Every test, plus every profile line that sets parameters (compiler/MPI variants)."""
+    out = {t: Entry(t) for t in sorted(tests)}
+    for p in sorted(list_profiles(site)):
+        for e in parse_profile(site, p):
+            if e.test in tests and e.params and e.id not in out:
+                out[e.id] = e
+    return list(out.values())
+
+
+def check_modules(site, tests, entries, cli, jobs, quiet=False, verbose=False):
+    """Probe each entry's modules; print one line each; return the entries with problems."""
     dis = site.disabled()
     work = []
     for e in entries:
         t = tests[e.test]
-        work.append((e.id, test_modules(t, site, resolve_params(t, site, e.params, cli)),
-                     e.id in dis or t.name in dis))
-    width = max(len(w[0]) for w in work)
-    bad = 0
-    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
-        futs = [(w, pool.submit(load_modules_probe, site, w[1]) if w[1] and not w[2] else None)
+        params = resolve_params(t, site, e.params, cli, e.id)
+        work.append((e, params, test_modules(t, site, params), e.id in dis or t.name in dis))
+    width = max(len(w[0].id) for w in work)
+    problems = []
+    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:
+        futs = [(w, pool.submit(load_modules_probe, site, w[2]) if w[2] and not w[3] else None)
                 for w in work]
-        for (wid, mods, disabled), fut in futs:
+        for (e, params, mods, disabled), fut in futs:
             if disabled:
-                if not args.quiet:
+                if not quiet:
                     print("%s  %-*s  disabled for this site" % (color("SKIP", "SKIP   "),
-                                                                 width, wid))
+                                                                 width, e.id))
                 continue
-            failed, loaded = fut.result() if fut else ([], [])
+            failed, loaded, swapped = fut.result() if fut else ([], [], [])
             if failed:
-                bad += 1
-                print("%s  %-*s  cannot load: %s" % (color("MODULE", "MISSING"), width, wid,
+                print("%s  %-*s  cannot load: %s" % (color("MODULE", "MISSING"), width, e.id,
                                                      " ".join(failed)))
-            elif not args.quiet:
-                shown = loaded if args.verbose else [m for m in loaded if "/" in m]
-                print("%s  %-*s  %s" % (color("PASS", "OK     "), width, wid,
+            elif swapped:
+                print("%s  %-*s  a later module replaced: %s" % (
+                    color("MODULE", "SWAPPED"), width, e.id, " ".join(swapped)))
+            elif not quiet:
+                shown = loaded if verbose else [m for m in loaded if "/" in m]
+                print("%s  %-*s  %s" % (color("PASS", "OK     "), width, e.id,
                                         " ".join(shown)[:110] or "(no modules)"))
-    print("\n%d of %d tests have module problems" % (bad, len(work)))
-    if bad:
-        print("Fix: map the name under [aliases] in sites/%s/site.conf, or add the test to "
-              "[disabled]." % (site.name or "<site>"))
-    return 1 if bad else 0
+            if failed or swapped:
+                problems.append((e, params, failed))
+    print("\n%d of %d tests have module problems" % (len(problems), len(work)))
+    return problems
+
+
+def cmd_check(args):
+    """Load every selected test's modules on this node (no jobs); --fix updates site.conf."""
+    site = detect_site(args.site)
+    guard_allocation(site, "check")
+    if args.fix and not site.dir:
+        die("--fix needs a site directory (hpctest site init <name>)")
+    tests = discover(site)
+    entries = build_entries(args, site, tests) if (args.tests or args.profile or args.all) \
+        else all_entries(site, tests)
+    problems = check_modules(site, tests, entries, parse_set(args.set), args.jobs, args.quiet,
+                             args.verbose)
+    if problems and args.fix:
+        return 1 if fix_modules(site, tests, problems, args.jobs) else 0
+    if problems:
+        print("Fix: hpctest check --fix (finds a compiler/MPI that loads, disables what is not "
+              "installed),\n     or map names under [aliases] in sites/%s/site.conf."
+              % (site.name or "<site>"))
+    return 1 if problems else 0
+
+
+SPIDER_SCRIPT = r"""
+type module >/dev/null 2>&1 || source "$1"
+eval "$2" >/dev/null 2>&1
+module -t spider 2>&1
+"""
+
+
+def module_families(site):
+    """Names of every installed module, including those behind compiler/MPI levels."""
+    r = run_cmd(["bash", "-c", SPIDER_SCRIPT, "spider", site.module_init, site.module_purge],
+                timeout=600)
+    names = set()
+    for m in module_tokens(r.stdout) + module_catalog(site, []):
+        names.update(m.split("/"))   # spider prints hierarchy paths: openmpi/4.1.7-x/hdf5/1.14
+    return names
+
+
+def newest_first(mods):
+    """Plain versions newest first, then suffixed ones (-cuda, _slurm, -gcc-8.5.0-abc)."""
+    def key(m):
+        v = m.split("/", 1)[1] if "/" in m else ""
+        return (bool(re.search(r"[^0-9.]", v)), [-int(n) for n in re.findall(r"\d+", v)])
+    return sorted(mods, key=key)
+
+
+def toolchain_candidates(current, avail, hints):
+    """Versions to try for one compiler/MPI parameter, most likely first."""
+    fam = current.split("/")[0]
+    versions = newest_first([m for m in avail if m.startswith(fam + "/")])
+    out = []
+    for m in [h for h in hints if h.startswith(fam + "/")] + [current] + versions:
+        if m not in out:
+            out.append(m)
+    return out[:MAX_CANDIDATES]
+
+
+def toolchain_keys(site, test, params):
+    """The test's compiler/MPI parameters that name a single module in its modules line."""
+    line = test.m("modules")
+    return [k for k in TOOLCHAIN_PARAMS
+            if re.search(r"\$\{%s\}|\$%s\b" % (k, k), line)
+            and len(site.resolve_modules(params.get(k, "").split())) == 1]
+
+
+def detect_toolchain(site, test, params, keys, avail, jobs):
+    """
+    Find values for the compiler/MPI parameters in keys with which all of the test's
+    modules load and none is swapped. First tried: the versions the test's other modules
+    load by themselves (e.g. netcdf-c -> openmpi/4.1.7), then the current value, then
+    newest installed. Returns {param: module}, or None.
+    """
+    rest = test_modules(test, site, dict(params, **{k: "" for k in keys}))
+    hints = load_modules_probe(site, rest)[1] if rest else []
+    lists = [toolchain_candidates(site.resolve_modules([params[k]])[0], avail, hints)
+             for k in keys]
+    order = sorted(itertools.product(*[range(len(l)) for l in lists]), key=sum)
+    combos = [dict(zip(keys, (l[i] for l, i in zip(lists, idx)))) for idx in order]
+
+    def clean(combo):
+        failed, _, swapped = load_modules_probe(site, test_modules(test, site,
+                                                                   dict(params, **combo)))
+        return not failed and not swapped
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:
+        for start in range(0, len(combos), max(1, jobs)):
+            batch = combos[start:start + max(1, jobs)]
+            for combo, ok in zip(batch, pool.map(clean, batch)):
+                if ok:
+                    return {k: v for k, v in combo.items() if v != params.get(k)}
+    return None
+
+
+def auto_keys(path):
+    """(section, key) pairs that an earlier --fix wrote (marked with AUTO_MARK)."""
+    out, sec = set(), None
+    for line in read_lines(path):
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            sec = m.group(1).strip()
+        elif AUTO_MARK in line:
+            k = re.match(r"\s*([^#;\s][^=]*?)\s*=", line)
+            if k:
+                out.add((sec, k.group(1)))
+    return out
+
+
+def fix_modules(site, tests, problems, jobs):
+    """
+    For each entry whose modules do not load cleanly: disable it if a module is not
+    installed at all, else search compiler/MPI versions and write [params:<entry>].
+    Values a person wrote are never replaced. Returns the number left unresolved.
+    """
+    path = os.path.join(site.dir, "site.conf")
+    auto = auto_keys(path)
+    print("\nSearching installed compiler/MPI versions ...")
+    families = module_families(site)
+    avail = module_catalog(site, [])
+    loadable = {m.split("/")[0] for m in avail}
+    width = max(len(p[0].id) for p in problems)
+    updates, unresolved = {}, 0
+    for e, params, failed in problems:
+        keys = toolchain_keys(site, tests[e.test], params)
+        # Not available: installed nowhere, or only behind a module level (a compiler, MPI,
+        # or a tree like "deprecated") that the test has no parameter to load.
+        missing = [m for m in failed if m.split("/")[0] not in loadable
+                   and (not keys or m.split("/")[0] not in families)]
+        if missing:
+            updates.setdefault("disabled", {})[e.id] = \
+                "not available: %s (or map it under [aliases])" % " ".join(missing)
+            print("%s  %-*s  not available: %s" % (color("SKIP", "DISABLE"), width, e.id,
+                                                   " ".join(missing)))
+            continue
+        found = detect_toolchain(site, tests[e.test], params, keys, avail, jobs) \
+            if keys else None
+        if found == {}:                   # the current values load cleanly on a retry
+            continue
+        sec = "params:" + e.id
+        kept = [k for k in found or {} if site.cp.has_option(sec, k) and (sec, k) not in auto]
+        if not found or kept:
+            unresolved += 1
+            print("%s  %-*s  %s" % (color("MODULE", "NO FIX "), width, e.id,
+                                    "no installed compiler/MPI version loads it cleanly"
+                                    if keys and not found else
+                                    "cannot load: %s" % " ".join(failed or ["(version swap)"])
+                                    if not found else
+                                    "loads with %s, but site.conf [%s] sets %s; not changed"
+                                    % (" ".join("%s=%s" % kv for kv in found.items()), sec,
+                                       " ".join(kept))))
+            continue
+        updates.setdefault(sec, {}).update(found)
+        print("%s  %-*s  %s" % (color("PASS", "FIXED  "), width, e.id,
+                                " ".join("%s=%s" % kv for kv in sorted(found.items()))))
+    if updates:
+        for sec, kv in updates.items():
+            for k in kv:
+                if (sec, k) not in auto:          # update_conf keeps an existing comment
+                    kv[k] = "%s    %s" % (kv[k], AUTO_MARK)
+        update_conf(path, updates, [])
+        print("\nUpdated %s (lines marked '%s'). Run 'hpctest check' to confirm."
+              % (path, AUTO_MARK))
+    return unresolved
 
 
 # ==========================================================================
@@ -1570,7 +1767,8 @@ default_time = 15
 
 [aliases]
 # portable name = this site's module name(s); an empty value loads nothing.
-# Commented lines were found as-is. NOT FOUND lines need a value or a [disabled] entry.
+# Every name is commented out: "found" ones load as-is. For a NOT FOUND one installed
+# under another name, uncomment it, give the name, and delete its [disabled] line.
 {aliases}
 
 [params]
@@ -1654,7 +1852,7 @@ def site_init(args):
             cands = sorted({a.split("/")[0] for a in avail
                             if key.replace("-", "") in a.lower().replace("-", "")
                             or a.lower().split("/")[0].startswith(stem)})[:5]
-            alias_lines.append("%s =    # NOT FOUND%s" % (
+            alias_lines.append("# %s =    # NOT FOUND%s" % (
                 n, " - candidates: " + ", ".join(cands) if cands else ""))
     os.makedirs(os.path.join(dest, "profiles"), exist_ok=True)
     os.makedirs(os.path.join(dest, "tests"), exist_ok=True)
@@ -1678,11 +1876,22 @@ def site_init(args):
                 fh.write(text)
     nf = sum(1 for l in alias_lines if "NOT FOUND" in l)
     print("\nWrote %s/site.conf  (%d of %d module names not found)" % (dest, nf, len(names)))
-    print("Next steps (docs/PORTING.md):\n"
-          "  1. edit %s/site.conf\n"
+    unresolved = 0
+    if not args.no_probe:
+        print("\nLoading every test's modules (compiler/MPI variants included) ...")
+        site = Site(name)
+        tests = discover(site)
+        problems = check_modules(site, tests, all_entries(site, tests), {}, args.jobs,
+                                 quiet=True)
+        if problems:
+            unresolved = fix_modules(site, tests, problems, args.jobs)
+    print("\nNext steps (docs/PORTING.md):\n"
+          "  1. review %s/site.conf%s\n"
           "  2. export HPCTEST_SITE=%s; hpctest check\n"
           "  3. hpctest run -p quick\n"
-          "  4. hpctest calibrate -p benchmarks -r 3" % (dest, name))
+          "  4. hpctest calibrate -p benchmarks -r 3"
+          % (dest, " (%d test(s) still need attention)" % unresolved if unresolved else "",
+             name))
     return 0
 
 
@@ -1760,7 +1969,9 @@ everyday use:
 
 new cluster (docs/PORTING.md):
   hpctest site init <name>              probe scheduler + modules, write sites/<name>/
-  hpctest check; hpctest run -p quick   adjust [aliases] / [disabled] until clean
+                                        (finds a compiler/MPI each test can load)
+  hpctest check --fix                   redo that detection after module changes
+  hpctest run -p quick                  then review [aliases] / [disabled]
   hpctest calibrate -p benchmarks -r 3  record benchmark baselines
 
 statuses:
@@ -1829,6 +2040,9 @@ def main(argv=None):
     sitearg(p)
     selection(p)
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--fix", action="store_true",
+                   help="find compiler/MPI versions that load, disable what is not installed, "
+                        "and record both in site.conf")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("run", help="run tests as scheduler jobs (or --local)")
@@ -1879,6 +2093,9 @@ def main(argv=None):
     p.add_argument("action", choices=["list", "show", "init"])
     p.add_argument("name", nargs="?")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-probe", action="store_true",
+                   help="init: do not load modules (no compiler/MPI detection)")
+    p.add_argument("-j", "--jobs", type=int, default=8, help="init: parallel module probes")
     p.set_defaults(func=cmd_site)
 
     p = sub.add_parser("new", help="create a test skeleton")

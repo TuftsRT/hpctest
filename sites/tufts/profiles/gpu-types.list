@@ -20,3 +20,14 @@ cuda_vector_add as=cuda_vector_add:rtx_pro_6000 -- --constraint=rtx_pro_6000
 gpu_bench as=gpu_bench:rtx_pro_6000 -- --constraint=rtx_pro_6000
 pytorch_gpu as=pytorch_gpu:rtx_pro_6000 -- --constraint=rtx_pro_6000
 tensorflow_gpu as=tensorflow_gpu:rtx_pro_6000 -- --constraint=rtx_pro_6000
+# Multi-GPU within a node (2 GPUs): P2P copies and DDP/NCCL depend on each model's topology
+cuda_p2p as=cuda_p2p:a100 -- --constraint=a100
+pytorch_ddp as=pytorch_ddp:a100 -- --constraint=a100
+cuda_p2p as=cuda_p2p:h100 -- --constraint=h100
+pytorch_ddp as=pytorch_ddp:h100 -- --constraint=h100
+cuda_p2p as=cuda_p2p:h200 -- --constraint=h200
+pytorch_ddp as=pytorch_ddp:h200 -- --constraint=h200
+cuda_p2p as=cuda_p2p:l40s -- --constraint=l40s
+pytorch_ddp as=pytorch_ddp:l40s -- --constraint=l40s
+cuda_p2p as=cuda_p2p:rtx_pro_6000 -- --constraint=rtx_pro_6000
+pytorch_ddp as=pytorch_ddp:rtx_pro_6000 -- --constraint=rtx_pro_6000

@@ -1,0 +1,19 @@
+intersect -wa -wb:
+chr1	100	500	geneA	chr1	450	460	peak1
+chr1	400	800	geneB	chr1	450	460	peak1
+chr1	2000	2500	geneC	chr1	2400	2600	peak2
+merge:
+chr1	100	800	geneA,geneB
+chr1	2000	2500	geneC
+chr2	50	150	geneD
+complement:
+chr1	0	100
+chr1	800	2000
+chr1	2500	5000
+chr2	0	50
+chr2	150	3000
+coverage:
+geneA	1	10	400	0.0250000
+geneB	1	10	400	0.0250000
+geneC	1	100	500	0.2000000
+geneD	0	0	100	0.0000000

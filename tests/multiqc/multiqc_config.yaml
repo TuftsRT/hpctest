@@ -1,0 +1,2 @@
+# no network access needed on compute nodes
+no_version_check: true

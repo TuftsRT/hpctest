@@ -1,5 +1,7 @@
 # run output and local notes
 runs/
+# run directories (YYYYMMDD-HHMMSS-xxxx) when workdir = $PWD and hpctest runs here
+/20[0-9][0-9][01][0-9][0-3][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-*/
 *.local.md
 __pycache__/
 *.pyc

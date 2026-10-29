@@ -1,0 +1,5 @@
+T1 est_counts 60.0 TPM 600000
+T2 est_counts 40.0 TPM 400000
+T3 est_counts 0.0 TPM 0
+n_processed:100
+n_pseudoaligned:100

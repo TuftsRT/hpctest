@@ -1,0 +1,4 @@
+GPU acceleration: yes
+step 0: temp 3.0000 epair -6.7734 etotal -2.2745 press -3.7034
+Loop time of ${time} on 1 procs for 200 steps with 4000 atoms
+final step 200, relative energy drift < 1%

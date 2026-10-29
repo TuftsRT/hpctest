@@ -1,0 +1,9 @@
+revcomp: TCAGCGGCCCATTACAATGGCCAT 
+protein: MAIVMGR* 
+GC fraction: 0.5417 
+GCC at: 4 17 
+reads per gene: 2 2 0 
+reduced: 1-120 300-400 
+edgeR FDR<0.01: gene01 gene02 gene03 gene04 gene05 
+DESeq2 padj<0.01: gene01 gene02 gene03 gene04 gene05 
+DESeq2 log2FC (genes 1-5) rounded: 3 3 3 -3 -3 

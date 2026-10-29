@@ -1,0 +1,3 @@
+file system: ${*}
+file size ok
+read back by other node: ok

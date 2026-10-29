@@ -1,0 +1,6 @@
+passed_filter_reads:80
+low_quality_reads:20
+too_short_reads:0
+adapter_trimmed_reads:30
+adapter_trimmed_bases:765
+reads written: 80, bases: 5635

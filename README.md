@@ -14,8 +14,9 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
   `sites/<name>/` directory that `hpctest site init` drafts for you.
 - **Clear failures.** Every result is classified (MODULE, BUILD, FAIL, PERF, JOB, …) and
   shown with the evidence: the first mismatching line, the build log, the module error.
-- **63 tests** covering compilers, MPI, numerical/I-O libraries, languages, applications,
-  GPUs, containers, Slurm/cgroups, node health, and CPU/GPU/network/file-system benchmarks.
+- **123 tests** covering compilers, MPI (multi-node correctness, MPI-IO, hybrid), numerical/I-O
+  libraries, languages, applications, GPUs (single, multi-GPU, multi-node), containers,
+  Slurm/cgroups, node health, and CPU/GPU/network/file-system benchmarks.
 
 Version 1.0.0 · MIT license
 
@@ -189,7 +190,7 @@ real-world example.
 | `hpctest list [-p PROFILE] [-t TAG]` | tests with resources, the modules they load here, description |
 | `hpctest profiles` | profiles and their sizes |
 | `hpctest show TEST` | parameters, modules and exact `sbatch` options this site will use |
-| `hpctest check [TESTS / -p PROFILE]` | load each test's modules on this node; no jobs |
+| `hpctest check [TESTS / -p PROFILE] [--fix]` | load each test's modules on this node; no jobs. Flags modules a later load silently swapped. `--fix` writes working compiler/MPI versions and `[disabled]` entries to `site.conf` |
 | `hpctest run TESTS / -p PROFILE / tag:TAG / --all` | submit, wait, report |
 | `hpctest report RUNDIR [--recheck]` | (re)evaluate a run, e.g. after `--no-wait` or new baselines |
 | `hpctest modules [GLOBS] [--with MODS]` | load every module in the catalog, report broken ones |
@@ -216,12 +217,15 @@ Useful `run` options:
 
 | Area | Tests |
 |------|-------|
-| Compilers | `c_hello`, `fortran_hello`, `openmp_hello`, `cuda_vector_add` |
-| MPI | `mpi_hello` (any MPI × compiler via params), `pnetcdf` |
-| Libraries | `fftw`, `gsl`, `hdf5`, `netcdf_c`, `netcdf_fortran`, `openblas`, `boost` |
-| Languages | `python_hello`, `python_numpy`, `r_hello`, `julia_hello`, `octave_hello`, `matlab_hello`, `mathematica_hello`, `sqlite` |
-| Applications | `blast`, `hmmer`, `quantum_espresso`, `gromacs`, `gnuplot`, `pytorch_cpu`, `pytorch_gpu`, `tensorflow_cpu`, `tensorflow_gpu` |
-| Scheduler | `slurm_cpuset`, `slurm_memory`, `slurm_oom`, `slurm_exclusive`, `slurm_multinode`, `slurm_timeout`, `slurm_array`, `slurm_dependency`, `slurm_accounting`, `slurm_srun_mpi` |
+| Compilers | `c_hello`, `fortran_hello`, `openmp_hello` (GCC, oneAPI, LLVM, NVHPC via params), `cmake_build` |
+| MPI | `mpi_hello` (any MPI × compiler via params), `mpi_collectives` (16 ranks on 4 nodes, every message verified), `mpi_io` (MPI-IO to one shared file from 2 nodes), `mpi_openmp` (hybrid, thread placement), `pnetcdf`, `scalapack` |
+| Libraries | `fftw`, `gsl`, `hdf5`, `netcdf_c`, `netcdf_fortran`, `openblas`, `boost`, `eigen`, `lapack` (netlib, OpenBLAS, MKL), `arpack`, `suite_sparse`, `nco`, `cdo`, `gdal` |
+| Languages | `python_hello`, `python_numpy`, `r_hello`, `r_bioconductor`, `julia_hello`, `octave_hello`, `matlab_hello`, `mathematica_hello`, `sqlite`, `java_hello`, `perl_hello`, `jupyter` |
+| Applications | `blast`, `hmmer`, `lammps`, `nwchem` (2 nodes), `gnuplot`, `pytorch_cpu`, `tensorflow_cpu` |
+| Bioinformatics | alignment: `samtools`, `bcftools`, `bedtools`, `minimap2`, `bowtie2`, `star`, `hisat2`; RNA-seq: `salmon`, `kallisto`, `featurecounts`; variants: `gatk4`, `picard`, `vcftools`, `plink2`; reads: `fastqc`, `fastp`, `cutadapt`, `trimmomatic`, `seqtk`, `multiqc`; assembly: `megahit`, `spades`; search: `diamond`, `mmseqs2`; phylogeny: `fasttree`, `iqtree`, `raxml_ng` (MPI, 2 nodes); genes: `prodigal` |
+| Tools | `valgrind`, `gdb`, `hwloc`, `gnu_parallel`, `snakemake`, `nextflow`, `ffmpeg`, `imagemagick` |
+| Scheduler | `slurm_cpuset`, `slurm_memory`, `slurm_oom`, `slurm_exclusive`, `slurm_multinode`, `slurm_timeout`, `slurm_array`, `slurm_dependency`, `slurm_accounting`, `slurm_srun_mpi`, `slurm_cpu_bind` |
+| GPU, multi-GPU, multi-node GPU | `cuda_vector_add`, `cuda_p2p` (2 GPUs: peer copies, data checked), `cuda_mpi` (CUDA-aware MPI between GPUs on 2 nodes), `pytorch_ddp` (DDP on 2 GPUs), `pytorch_ddp_multinode` (DDP on 2 nodes, reports the NCCL transport), `nccl_allreduce`, `lammps_gpu`, `quantum_espresso_gpu`, `gromacs`, `pytorch_gpu`, `tensorflow_gpu` |
 | Node health | `node_health`, `node_rdma`, `slurm_node_config`, `gpu_health`, `gpu_isolation` |
 | Containers | `apptainer`, `apptainer_gpu`, `apptainer_mpi` |
 | Benchmarks | `stream`, `linpack_mkl`, `hpcg_mkl`, `db12`, `r_benchmark`, `io_fio`, `gpu_bench`, `nccl_allreduce`, `osu_latency`, `osu_bw`, `osu_bibw`, `osu_allreduce`, `osu_alltoall`, `osu_bcast`, `osu_scatter` |
@@ -233,18 +237,19 @@ Useful `run` options:
 | Profile | Contents |
 |---------|----------|
 | `quick` | C, OpenMP, MPI, Python, R, SQLite, cgroup CPU and memory limits, node basics |
-| `scheduler` | cgroups, OOM kill, exclusive allocation, multi-node `srun`, node hardware vs. Slurm config, step time limits, job arrays, dependencies, `sacct` accounting, `srun --mpi` launch |
+| `scheduler` | cgroups, OOM kill, exclusive allocation, multi-node `srun`, node hardware vs. Slurm config, step time limits, job arrays, dependencies, `sacct` accounting, `srun --mpi` launch, per-task CPU binding |
 | `node` | clock sync, user/group lookup, DNS, `/tmp` space, file systems, RDMA ports, hardware vs. Slurm config |
 | `containers` | Apptainer: image pull, user, bind mounts, exit codes; MPI inside a container |
-| `compilers` | GCC and Intel oneAPI (C, Fortran, OpenMP), CUDA |
-| `mpi` | OpenMPI and MVAPICH2 with GCC and oneAPI, Intel MPI, PnetCDF |
-| `libs` | FFTW, GSL, HDF5, netCDF-C/Fortran, OpenBLAS, Boost |
-| `lang` | Python, NumPy, R, Julia, Octave, MATLAB, Mathematica, SQLite |
-| `apps` | BLAST+, HMMER, Quantum ESPRESSO, gnuplot, PyTorch and TensorFlow (CPU) |
-| `gpu` | CUDA, GROMACS, PyTorch, TensorFlow, GPU benchmark, GPU isolation and health, NCCL, Apptainer `--nv` |
+| `compilers` | GCC, Intel oneAPI, LLVM and NVHPC (C, Fortran, OpenMP), CUDA, CMake build |
+| `mpi` | OpenMPI and MVAPICH2 with GCC and oneAPI, Intel MPI; multi-node data correctness (Open MPI, Intel MPI, MVAPICH2), MPI-IO, hybrid MPI+OpenMP, PnetCDF, ScaLAPACK |
+| `libs` | FFTW, GSL, HDF5, netCDF-C/Fortran, OpenBLAS, Boost, Eigen, LAPACK (3 providers), ARPACK, SuiteSparse, NCO, CDO, GDAL |
+| `lang` | Python, NumPy, R, Julia, Octave, MATLAB, Mathematica, SQLite, Java, Perl, Jupyter |
+| `apps` | BLAST+, HMMER, LAMMPS, NWChem, gnuplot, PyTorch and TensorFlow (CPU), 28 bioinformatics tools |
+| `tools` | Valgrind, GDB, hwloc, GNU parallel, Snakemake, Nextflow, FFmpeg, ImageMagick |
+| `gpu` | CUDA, GROMACS, PyTorch, TensorFlow, LAMMPS and Quantum ESPRESSO GPU builds, GPU benchmark, GPU isolation and health, multi-GPU (P2P, NCCL, PyTorch DDP), multi-node GPU (CUDA-aware MPI, DDP), Apptainer `--nv` |
 | `benchmarks` | STREAM, LINPACK, HPCG, DB12, R-benchmark-25, fio |
 | `network` | OSU latency, bandwidth, bi-bandwidth, allreduce, alltoall, bcast, scatter |
-| `default` | scheduler + node + compilers + mpi + libs + lang + apps + containers |
+| `default` | scheduler + node + compilers + mpi + libs + lang + apps + containers + tools |
 | `full` | default + gpu + benchmarks + network |
 
 Sites add their own; for example, `sites/tufts/profiles/gpu-types.list` runs the GPU
@@ -262,6 +267,9 @@ tests once on every GPU model in the cluster.
 | `io_fio` | file system: sequential write/read MB/s, 4k random-read IOPS (direct I/O) |
 | `gpu_bench` | GPU memory bandwidth, host↔device GB/s, FP32 and FP16 tensor-core GEMM TFLOPS |
 | `nccl_allreduce` | NCCL all-reduce bus bandwidth across 2 GPUs of one node (GB/s) |
+| `cuda_p2p` | GPU0↔GPU1 copy bandwidth within a node (GB/s) |
+| `pytorch_ddp`, `pytorch_ddp_multinode` | NCCL all-reduce bus bandwidth through PyTorch, in one node and across 2 nodes (GB/s) |
+| `cuda_mpi` | MPI device-to-device bandwidth between GPUs on 2 nodes (GB/s) |
 | `osu_*` | MPI point-to-point and collective latency/bandwidth |
 
 Numbers are captured from the output and compared with the site's `baselines.conf`:
@@ -285,17 +293,41 @@ hpctest calibrate --from RUNDIR [RUNDIR ...]     # from runs you already have
 ## Adopting hpctest at your site
 
 ```bash
-hpctest site init mysite            # probes Slurm and the module system
-$EDITOR sites/mysite/site.conf      # fix [aliases] marked NOT FOUND, GPU settings, ...
+hpctest site init mysite            # probes Slurm and modules, finds working compiler/MPI
+$EDITOR sites/mysite/site.conf      # review: [disabled], aliases marked NOT FOUND, GPU settings
 export HPCTEST_SITE=mysite
-hpctest check                       # until clean (map or [disabled] what's missing)
+hpctest check                       # should be clean; after module changes: hpctest check --fix
 hpctest run -p quick
 hpctest calibrate -p benchmarks -r 3
 ```
 
 `site init` writes the GPU partition, CPU architecture and GPU model features from
 `sinfo`, the module init file, and an `[aliases]` section listing every module name
-the tests use that `module avail` can't find, with candidate matches.
+the tests use that `module avail` can't find, with candidate matches. It then loads
+every test's modules, including the compiler and MPI variants in the profiles, and fixes
+what it can:
+
+- **Compiler/MPI detection.** If a test's modules fail to load, or a later module
+  silently swaps the MPI version (Lmod keeps `is-loaded openmpi` true), it tries other
+  installed versions of the test's `compiler`/`mpi` parameters. It starts with the
+  versions the test's other modules load by themselves (`netcdf-c` →
+  `openmpi/4.1.7`) and writes the first clean combination as
+  `[params:<test>]  compiler = gcc/12.4.0    # detected by hpctest`.
+- **Not available.** Tests whose modules don't exist, or exist only behind an unrelated
+  module level, go under `[disabled]` with the reason, e.g. `lammps_gpu = not available:
+  lammps+cuda`. Map the name under `[aliases]` and delete the line to enable the test.
+
+Detection loads modules only; a `hpctest run` confirms the result. Lines a person writes are
+never replaced, and `hpctest check --fix` redoes detection after module changes.
+
+`site init` is for a new site. It won't touch an existing `site.conf`:
+
+| Command | Effect on `sites/<name>/` |
+|---------|---------------------------|
+| `hpctest site init <name>` | writes `site.conf` and runs detection; stops if `site.conf` already exists |
+| `hpctest site init <name> --force` | rewrites `site.conf` from scratch (**hand edits are lost**); keeps `baselines.conf`, `smoke.conf`, `profiles/`, `tests/` |
+| `hpctest site init <name> --no-probe` | writes `site.conf` without loading modules (no detection) |
+| `hpctest check --fix` | for an existing site: edits `site.conf` in place, adding or updating only `# detected by hpctest` lines; comments and your own lines are kept |
 **[docs/PORTING.md](docs/PORTING.md)** walks through it, including EasyBuild naming,
 MPI launchers, per-user limits and cron setup.
 

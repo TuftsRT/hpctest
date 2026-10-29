@@ -8,3 +8,12 @@ netcdf_c
 netcdf_fortran
 openblas
 boost
+eigen
+lapack
+lapack lapack=openblas lapack_libs=-lopenblas as=lapack:openblas
+lapack lapack=intel-oneapi-mkl "lapack_libs=-lmkl_gf_lp64 -lmkl_sequential -lmkl_core" as=lapack:mkl
+nco
+cdo
+gdal
+arpack
+suite_sparse

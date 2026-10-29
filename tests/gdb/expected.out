@@ -1,0 +1,7 @@
+received signal SIGSEGV
+#0 crash_here
+#1 recurse
+#2 recurse
+#3 recurse
+#4 main
+$1 = 0

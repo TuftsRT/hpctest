@@ -1,0 +1,7 @@
+Total reads processed: 100
+Reads with adapters: 30 (30.0%)
+Reads that were too short: 20 (20.0%)
+Reads written (passing filters): 80 (80.0%)
+Quality-trimmed: 1,200 bp (15.0%)
+Total written (filtered): 5,635 bp (70.4%)
+read lengths (count length): 50:80 

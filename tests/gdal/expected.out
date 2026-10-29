@@ -1,0 +1,7 @@
+Driver: GTiff/GeoTIFF
+Size is 20, 10
+    STATISTICS_MEAN=7.5
+EPSG:3857 x=1113194.91 y=6446275.84
+warp ok
+Geometry: Point
+Feature Count: 2

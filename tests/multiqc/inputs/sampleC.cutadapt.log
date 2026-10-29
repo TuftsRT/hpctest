@@ -1,0 +1,65 @@
+This is cutadapt 3.7 with Python 3.7.12
+Command line parameters: -j 2 -q 20 -m 25 -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA -o trimmed.fq reads.fq
+Processing reads on 2 cores in single-end mode ...
+Finished in 0.02 s (247 µs/read; 0.24 M reads/minute).
+
+=== Summary ===
+
+Total reads processed:                     100
+Reads with adapters:                        30 (30.0%)
+
+== Read fate breakdown ==
+Reads that were too short:                  20 (20.0%)
+Reads written (passing filters):            80 (80.0%)
+
+Total basepairs processed:         8,000 bp
+Quality-trimmed:                   1,200 bp (15.0%)
+Total written (filtered):          5,635 bp (70.4%)
+
+=== Adapter 1 ===
+
+Sequence: AGATCGGAAGAGCACACGTCTGAACTCCAGTCA; Type: regular 3'; Length: 33; Trimmed: 30 times
+
+Minimum overlap: 3
+No. of allowed errors:
+1-9 bp: 0; 10-19 bp: 1; 20-29 bp: 2; 30-33 bp: 3
+
+Bases preceding removed adapters:
+  A: 16.7%
+  C: 23.3%
+  G: 26.7%
+  T: 33.3%
+  none/other: 0.0%
+
+Overview of removed sequences
+length	count	expect	max.err	error counts
+11	1	0.0	1	1
+12	1	0.0	1	1
+13	1	0.0	1	1
+14	1	0.0	1	1
+15	1	0.0	1	1
+16	1	0.0	1	1
+17	1	0.0	1	1
+18	1	0.0	1	1
+19	1	0.0	1	1
+20	1	0.0	2	1
+21	1	0.0	2	1
+22	1	0.0	2	1
+23	1	0.0	2	1
+24	1	0.0	2	1
+25	1	0.0	2	1
+26	1	0.0	2	1
+27	1	0.0	2	1
+28	1	0.0	2	1
+29	1	0.0	2	1
+30	1	0.0	3	1
+31	1	0.0	3	1
+32	1	0.0	3	1
+33	1	0.0	3	1
+34	1	0.0	3	1
+35	1	0.0	3	1
+36	1	0.0	3	1
+37	1	0.0	3	1
+38	1	0.0	3	1
+39	1	0.0	3	1
+40	1	0.0	3	1

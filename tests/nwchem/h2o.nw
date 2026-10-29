@@ -1,0 +1,17 @@
+echo
+start h2o
+title "H2O SCF and MP2, 6-31G*"
+memory total 400 mb
+geometry units angstrom noautosym
+  O   0.000000   0.000000   0.117790
+  H   0.000000   0.755453  -0.471161
+  H   0.000000  -0.755453  -0.471161
+end
+basis
+  * library 6-31g*
+end
+scf
+  thresh 1e-8
+end
+task scf energy
+task mp2 energy

@@ -1,0 +1,11 @@
+# Tools: debuggers, hardware topology, workflow managers, media processing
+# Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
+#        @profile includes another profile.
+valgrind
+gdb
+hwloc
+gnu_parallel
+snakemake
+nextflow
+ffmpeg
+imagemagick

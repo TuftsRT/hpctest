@@ -1,0 +1,5 @@
+lstopo: machine found
+packages >= 1
+NUMA nodes >= 1
+allowed PUs = nproc: yes
+allowed PUs = SLURM_CPUS_PER_TASK: yes

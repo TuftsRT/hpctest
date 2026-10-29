@@ -1,0 +1,6 @@
+world size 2, nodes 1, distinct GPUs 2
+allreduce sum: ok
+loss decreased: yes
+weights identical on all ranks: yes
+busbw_GBps ${busbw_GBps}
+nccl transport: ${*}

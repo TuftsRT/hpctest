@@ -1,0 +1,7 @@
+sendrecv   ok
+isend      ok
+bcast      ok
+allreduce  ok
+alltoall   ok
+ranks 16, nodes 4
+ranks per node: min 4 max 4

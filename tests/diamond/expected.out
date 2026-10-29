@@ -1,0 +1,4 @@
+query1 prot03 90% 200
+query2 prot07 90% 200
+query3 prot15 90% 200
+queries without hits: query4 

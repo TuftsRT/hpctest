@@ -1,0 +1,6 @@
+T1 reads 60.0 TPM 600000
+T2 reads 40.0 TPM 400000
+T3 reads 0.0 TPM 0
+num_processed:100
+num_mapped:100
+expected_format:U

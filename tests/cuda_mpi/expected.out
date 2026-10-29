@@ -1,0 +1,6 @@
+${?}MPI reports CUDA-aware: yes
+sendrecv device buffers: ok
+allreduce device buffers: ok
+bcast device buffers: ok
+ranks 2 on 2 nodes
+d2d_GBps ${d2d_GBps}

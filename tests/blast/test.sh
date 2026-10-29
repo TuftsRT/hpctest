@@ -1,6 +1,6 @@
 #!/bin/bash
 #@ description: BLAST+ blastn search of E. coli genes against a site database
-#@ param blast = blast-plus
+#@ param blast = blast
 #@ param blast_db =
 #@ param blast_db_name = tsa_nt
 #@ requires-param: blast_db

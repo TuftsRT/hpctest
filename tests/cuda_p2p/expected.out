@@ -1,0 +1,7 @@
+GPUs visible: 2
+peer access: ${*}
+GPU0 -> GPU1: data ok
+GPU0_to_GPU1_GBps ${GPU0_to_GPU1_GBps}
+GPU1 -> GPU0: data ok
+GPU1_to_GPU0_GBps ${GPU1_to_GPU0_GBps}
+${?}GPU1 kernel reads GPU0 memory: data ok

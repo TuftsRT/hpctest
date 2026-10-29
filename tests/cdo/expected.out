@@ -1,0 +1,5 @@
+fldmean   = 3.5
+remapbil  = 2
+timesteps = 10
+timmean   = 5.5
+variable  = t

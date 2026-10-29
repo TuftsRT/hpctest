@@ -142,6 +142,24 @@ class TestSite(Sandbox):
         self.assertEqual(p, {"greeting": "site", "who": "cli", "style": "profile"})
         self.assertNotIn("undeclared", p)
 
+    def test_entry_params(self):
+        self.add_test("mpi", "#@ param mpi = openmpi\n")
+        write(os.path.join(h.SITES_DIR, "lab", "site.conf"), """
+            [params:mpi]
+            mpi = openmpi/4
+            [params:mpi:intel]
+            mpi = impi/2021
+            """)
+        site, t = h.Site("lab"), h.discover(h.Site("lab"))["mpi"]
+        self.assertEqual(h.resolve_params(t, site, {"mpi": "impi"}, {}, "mpi:intel")["mpi"],
+                         "impi/2021")
+        self.assertEqual(h.resolve_params(t, site, {}, {}, "mpi")["mpi"], "openmpi/4")
+
+    def test_newest_first(self):
+        self.assertEqual(h.newest_first(["gcc/9.3.0", "gcc/12.4.0-cuda", "gcc/12.4.0",
+                                         "gcc/15.1.0"]),
+                         ["gcc/15.1.0", "gcc/12.4.0", "gcc/9.3.0", "gcc/12.4.0-cuda"])
+
     def test_aliases(self):
         self.assertEqual(self.site.resolve_modules(["gcc", "nothing", "fftw"]),
                          ["gcc/12", "fftw"])
@@ -232,6 +250,84 @@ class TestBaselines(Sandbox):
         self.assertIn("-50.0%", detail)
         job["arch"] = "zen3"
         self.assertIn("no baseline", h.compare_baselines(job, self.site, [])[1])
+
+
+class TestCheckFix(Sandbox):
+    """check --fix against a stub that behaves like a hierarchical Lmod tree."""
+
+    def setUp(self):
+        super().setUp()
+        # gcc defaults to gcc/15, whose netcdf-c is broken; arpack depends on openmpi/4
+        # and silently replaces openmpi/5 (still "is-loaded openmpi").
+        write(os.path.join(self.tmp, "lmod.sh"), r"""
+            module() {
+              case "$1" in
+                load)
+                  case "$2" in
+                    gcc|gcc/15) L="$L gcc/15" ;;
+                    gcc/12) L="$L gcc/12" ;;
+                    openmpi|openmpi/5) L="$L openmpi/5" ;;
+                    openmpi/4) L="$L openmpi/4" ;;
+                    netcdf-c) case "$L" in *gcc/15*) return 1 ;; esac; L="$L netcdf-c/4" ;;
+                    arpack) L="${L/ openmpi\/5/}"
+                            case "$L" in *openmpi/4*) ;; *) L="$L openmpi/4" ;; esac
+                            L="$L arpack/3" ;;
+                    *) return 1 ;;
+                  esac ;;
+                is-loaded) case "$L " in *" $2 "*|*" $2/"*) return 0 ;; esac; return 1 ;;
+                -t)
+                  case "$2" in
+                    list) for m in $L; do echo "$m"; done >&2 ;;
+                    avail|spider) printf '%s\n' gcc/15 gcc/12 openmpi/5 openmpi/4 \
+                                    netcdf-c/4 arpack/3 >&2 ;;
+                  esac ;;
+              esac
+            }
+            """)
+        self.conf = os.path.join(h.SITES_DIR, "auto", "site.conf")
+        write(self.conf, """
+            [modules]
+            init = %s/lmod.sh
+            purge = true
+            """ % self.tmp)
+        self.add_test("netcdf", "#@ param compiler = gcc\n#@ modules: ${compiler} netcdf-c\n")
+        self.add_test("arpack", "#@ param compiler = gcc\n#@ param mpi = openmpi\n"
+                                "#@ modules: ${compiler} ${mpi} arpack\n")
+        self.add_test("blast", "#@ modules: blast\n")
+        self.add_test("fine", "#@ param compiler = gcc\n#@ modules: ${compiler}\n")
+
+    def check(self, fix):
+        args = types.SimpleNamespace(site="auto", tests=[], profile=None, all=False, set=None,
+                                     jobs=2, quiet=True, verbose=False, fix=fix)
+        saved = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            return h.cmd_check(args)
+        finally:
+            sys.stdout.close()
+            sys.stdout = saved
+
+    def test_swap_detected(self):
+        site = h.Site("auto")
+        failed, _, swapped = h.load_modules_probe(site, ["gcc", "openmpi", "arpack"])
+        self.assertEqual((failed, swapped), ([], ["openmpi/5"]))
+
+    def test_fix(self):
+        self.assertEqual(self.check(fix=True), 0)
+        site = h.Site("auto")
+        self.assertEqual(site.get("params:netcdf", "compiler"), "gcc/12")
+        self.assertEqual(site.section("params:arpack"), {"mpi": "openmpi/4"})
+        self.assertIn("not available: blast", site.get("disabled", "blast"))
+        self.assertFalse(site.cp.has_section("params:fine"))
+        with open(self.conf) as fh:
+            self.assertIn("compiler = gcc/12    " + h.AUTO_MARK, fh.read())
+        self.assertEqual(self.check(fix=False), 0)
+
+    def test_fix_keeps_values_people_wrote(self):
+        with open(self.conf, "a") as fh:
+            fh.write("[params:netcdf]\ncompiler = gcc/15\n")
+        self.assertEqual(self.check(fix=True), 1)
+        self.assertEqual(h.Site("auto").get("params:netcdf", "compiler"), "gcc/15")
 
 
 class TestLocalRun(Sandbox):

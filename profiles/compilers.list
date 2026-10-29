@@ -8,3 +8,9 @@ fortran_hello compiler=intel-oneapi-compilers fc=ifx as=fortran_hello:oneapi
 openmp_hello
 openmp_hello compiler=intel-oneapi-compilers cc=icx as=openmp_hello:oneapi
 cuda_vector_add
+c_hello compiler=llvm cc=clang as=c_hello:llvm
+openmp_hello compiler=llvm cc=clang as=openmp_hello:llvm
+c_hello compiler=nvhpc cc=nvc as=c_hello:nvhpc
+fortran_hello compiler=nvhpc fc=nvfortran as=fortran_hello:nvhpc
+openmp_hello compiler=nvhpc cc=nvc ompflag=-mp as=openmp_hello:nvhpc
+cmake_build

@@ -1,0 +1,3 @@
+sampleA total_passed=9 mapped_passed=8 duplicates_passed=0
+sampleB total_passed=48 mapped_passed=48 duplicates_passed=8
+reads r_processed=100 r_with_adapters=30 r_too_short=20 r_written=80 bp_written=5635

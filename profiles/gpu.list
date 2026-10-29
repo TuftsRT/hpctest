@@ -1,4 +1,4 @@
-# GPU tests
+# GPU tests: single GPU, multi-GPU in one node (P2P, NCCL, DDP), multi-node GPU (CUDA-aware MPI, DDP)
 # Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
 #        @profile includes another profile.
 cuda_vector_add
@@ -10,3 +10,9 @@ gpu_isolation
 gpu_health
 nccl_allreduce
 apptainer_gpu
+cuda_p2p
+cuda_mpi
+pytorch_ddp
+pytorch_ddp_multinode
+lammps_gpu
+quantum_espresso_gpu

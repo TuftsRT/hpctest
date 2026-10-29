@@ -1,4 +1,4 @@
-# Main health check: scheduler, node health, compilers, MPI, libraries, languages, applications, containers
+# Main health check: scheduler, node health, compilers, MPI, libraries, languages, applications, containers, tools
 # Lines: test [param=value ...] [xN] [need=M] [serial] [as=label] [-- sbatch options]
 #        @profile includes another profile.
 @scheduler
@@ -9,3 +9,4 @@
 @lang
 @apps
 @containers
+@tools

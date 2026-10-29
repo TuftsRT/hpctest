@@ -1,0 +1,8 @@
+>chrA:101-130
+CTGTGTCCACCCCATCGGACTGGCATTTTT
+first positions: 10 40 60 
+reads in chrA:1-200: 4
+chrA	1000	8	0
+*	0	0	1
+9 + 0 in total (QC-passed reads + QC-failed reads)
+8 + 0 mapped (88.89% : N/A)
