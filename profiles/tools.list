@@ -5,7 +5,6 @@ valgrind
 gdb
 hwloc
 gnu_parallel
-snakemake
 nextflow
 ffmpeg
 imagemagick

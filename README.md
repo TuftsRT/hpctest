@@ -14,7 +14,7 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
   `sites/<name>/` directory that `hpctest site init` drafts for you.
 - **Clear failures.** Every result is classified (MODULE, BUILD, FAIL, PERF, JOB, …) and
   shown with the evidence: the first mismatching line, the build log, the module error.
-- **123 tests** covering compilers, MPI (multi-node correctness, MPI-IO, hybrid), numerical/I-O
+- **122 tests** covering compilers, MPI (multi-node correctness, MPI-IO, hybrid), numerical/I-O
   libraries, languages, applications, GPUs (single, multi-GPU, multi-node), containers,
   Slurm/cgroups, node health, and CPU/GPU/network/file-system benchmarks.
 
@@ -223,7 +223,7 @@ Useful `run` options:
 | Languages | `python_hello`, `python_numpy`, `r_hello`, `r_bioconductor`, `julia_hello`, `octave_hello`, `matlab_hello`, `mathematica_hello`, `sqlite`, `java_hello`, `perl_hello`, `jupyter` |
 | Applications | `blast`, `hmmer`, `lammps`, `nwchem` (2 nodes), `gnuplot`, `pytorch_cpu`, `tensorflow_cpu` |
 | Bioinformatics | alignment: `samtools`, `bcftools`, `bedtools`, `minimap2`, `bowtie2`, `star`, `hisat2`; RNA-seq: `salmon`, `kallisto`, `featurecounts`; variants: `gatk4`, `picard`, `vcftools`, `plink2`; reads: `fastqc`, `fastp`, `cutadapt`, `trimmomatic`, `seqtk`, `multiqc`; assembly: `megahit`, `spades`; search: `diamond`, `mmseqs2`; phylogeny: `fasttree`, `iqtree`, `raxml_ng` (MPI, 2 nodes); genes: `prodigal` |
-| Tools | `valgrind`, `gdb`, `hwloc`, `gnu_parallel`, `snakemake`, `nextflow`, `ffmpeg`, `imagemagick` |
+| Tools | `valgrind`, `gdb`, `hwloc`, `gnu_parallel`, `nextflow`, `ffmpeg`, `imagemagick` |
 | Scheduler | `slurm_cpuset`, `slurm_memory`, `slurm_oom`, `slurm_exclusive`, `slurm_multinode`, `slurm_timeout`, `slurm_array`, `slurm_dependency`, `slurm_accounting`, `slurm_srun_mpi`, `slurm_cpu_bind` |
 | GPU, multi-GPU, multi-node GPU | `cuda_vector_add`, `cuda_p2p` (2 GPUs: peer copies, data checked), `cuda_mpi` (CUDA-aware MPI between GPUs on 2 nodes), `pytorch_ddp` (DDP on 2 GPUs), `pytorch_ddp_multinode` (DDP on 2 nodes, reports the NCCL transport), `nccl_allreduce`, `lammps_gpu`, `quantum_espresso_gpu`, `gromacs`, `pytorch_gpu`, `tensorflow_gpu` |
 | Node health | `node_health`, `node_rdma`, `slurm_node_config`, `gpu_health`, `gpu_isolation` |
