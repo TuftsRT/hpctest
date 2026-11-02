@@ -1062,6 +1062,229 @@ def wait_for_jobs(jobs, site, manifest, args):
         sys.stdout.write("\r\033[K")
 
 
+# ==========================================================================
+# nodes: run a profile once on every node
+# ==========================================================================
+
+# sinfo %t states a test job can start on soon. Anything else (down, drain, drng, fail,
+# maint, futr, unk, boot, ...) is reported as SKIP instead of leaving a job queued for
+# hours. "alloc" (every CPU in use) is left out too: a job pinned to such a node waits for
+# the node's current jobs to end, which can be days; --states ...,alloc queues anyway.
+USABLE_STATES = ("idle", "mix", "comp", "plnd")
+# sinfo state suffixes: * not responding, ~ powered off, # powering up, ! / % powering
+# down, $ maintenance reservation, @ / ^ reboot pending or issued.
+UNUSABLE_FLAGS = "*~#!%$@^"
+
+
+def slurm_nodes(partitions=None, nodelist=None):
+    """{node: dict(partitions=[...], default=partition or None, state=..., gres=...)}"""
+    cmd = ["sinfo", "-h", "-N", "-o", "%N|%P|%t|%G"]
+    if partitions:
+        cmd += ["-p", ",".join(partitions)]
+    if nodelist:
+        cmd += ["-n", nodelist]
+    r = run_cmd(cmd)
+    if r.returncode != 0:
+        die("sinfo failed: %s" % (r.stderr.strip() or "exit %d" % r.returncode))
+    nodes = {}
+    for line in r.stdout.splitlines():
+        f = line.split("|")
+        if len(f) < 4:
+            continue
+        name, part, state, gres = f[0], f[1], f[2], f[3]
+        n = nodes.setdefault(name, dict(partitions=[], default=None, state=state, gres=""))
+        if part.endswith("*"):
+            part = part[:-1]
+            n["default"] = part
+        if part not in n["partitions"]:
+            n["partitions"].append(part)
+        if gres and gres != "(null)":
+            n["gres"] = gres
+    return nodes
+
+
+def node_partition(info, wanted):
+    """The partition to test a node through: the first requested one it is in, else the
+    cluster default partition, else the first partition sinfo lists it in."""
+    for p in wanted or []:
+        if p in info["partitions"]:
+            return p
+    return info["default"] or info["partitions"][0]
+
+
+def node_unusable(state, states):
+    base = state.rstrip(UNUSABLE_FLAGS + "-")
+    if any(c in UNUSABLE_FLAGS for c in state[len(base):]):
+        return True
+    return base not in states
+
+
+def node_test_skip(test, info, wait_exclusive):
+    """Why one test cannot usefully run on one (usable) node, or None."""
+    if test.nodes > 1:
+        return "multi-node test (%d nodes)" % test.nodes
+    if test.gpus and "gpu" not in info["gres"]:
+        return "node has no GPU"
+    if test.exclusive and not wait_exclusive and not info["state"].startswith("idle"):
+        return "needs the whole node, node is %s (--wait-exclusive to queue)" % info["state"]
+    return None
+
+
+def split_list(values):
+    return [x for v in values or [] for x in v.split(",") if x]
+
+
+def cmd_nodes(args):
+    site = detect_site(args.site)
+    tests = discover(site)
+    if not (args.tests or args.profile or args.all):
+        args.profile = ["node"]
+    entries = build_entries(args, site, tests)
+    cli_params = parse_set(args.set)
+    extra = list(args.sbatch or [])
+    if not shutil.which("sbatch") or not shutil.which("sinfo"):
+        die("sbatch/sinfo not found; 'hpctest nodes' needs Slurm")
+
+    wanted = split_list(args.partition)
+    states = split_list(args.states) or list(USABLE_STATES)
+    excludes = split_list(args.exclude)
+    nodes = slurm_nodes(wanted, args.nodelist)
+    nodes = {n: i for n, i in nodes.items()
+             if not any(fnmatch.fnmatch(n, x) for x in excludes)}
+    if not nodes:
+        die("no nodes match (check --partition / --nodelist / --exclude)")
+
+    plan = []                                   # (node, partition, state, skip reason)
+    for name in sorted(nodes, key=lambda s: [int(t) if t.isdigit() else t
+                                             for t in re.split(r"(\d+)", s)]):
+        info = nodes[name]
+        why = None
+        if node_unusable(info["state"], states):
+            why = "node is %s" % info["state"]
+            if info["state"] == "alloc":
+                why += " (every CPU in use; --states %s,alloc to queue anyway)" \
+                    % ",".join(states)
+        plan.append((name, node_partition(info, wanted), info["state"], why))
+    usable = sum(1 for p in plan if not p[3])
+
+    if args.dry_run:
+        print("%-16s  %-12s  %-8s  %s" % ("NODE", "PARTITION", "STATE", "ACTION"))
+        njobs = 0
+        for name, part, state, why in plan:
+            if why:
+                action = "skip: " + why
+            else:
+                run = [e.id for e in entries
+                       if not node_test_skip(tests[e.test], nodes[name], args.wait_exclusive)]
+                skip = [e.id for e in entries if e.id not in run]
+                njobs += len(run)
+                action = "test: " + " ".join(run) + ("  (skip: %s)" % " ".join(skip)
+                                                     if skip else "")
+            print("%-16s  %-12s  %-8s  %s" % (name, part, state, action))
+        print("\n%d node(s): %d to test, %d skipped; %d job(s) would be submitted"
+              % (len(plan), usable, len(plan) - usable, njobs))
+        return 0
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    rid = stamp + "-nodes-" + "".join(random.choice(string.ascii_lowercase) for _ in range(4))
+    rundir = os.path.abspath(os.path.join(args.workdir or site.workdir(), rid))
+    os.makedirs(rundir)
+    args.rundir = rundir
+    jobs = []
+    for name, part, state, why in plan:
+        info = nodes[name]
+        for j in make_jobs(entries, tests, site, cli_params, os.path.join(rundir, name), False):
+            t = tests[j["test"]]
+            j.update(id="%s@%s" % (j["id"], name), target=name, partition=part,
+                     sbatch=j["sbatch"] + ["--partition=" + part, "--nodelist=" + name])
+            jobs.append(j)
+            if j["done"]:
+                continue                        # already SKIP (disabled for site, ...)
+            reason = why or node_test_skip(t, info, args.wait_exclusive)
+            if reason:
+                j.update(status="SKIP", detail=reason, done=True)
+    manifest = dict(version=VERSION, created=stamp, rundir=rundir, site=site.name,
+                    mode="nodes", argv=sys.argv, params=cli_params, sbatch=extra, jobs=jobs)
+    save_manifest(manifest)
+    print("hpctest %s  site: %s  nodes: %d (%d skipped)  tests/node: %d  jobs: %d\n"
+          "run directory: %s" % (VERSION, site.name, len(plan), len(plan) - usable,
+                                 len(entries), sum(1 for j in jobs if not j["done"]), rundir))
+
+    def go(j):
+        submit(j, prepare(j, tests[j["test"]], site), extra + j["sbatch"], j["serial"])
+    todo = [j for j in jobs if not j["done"]]
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        list(pool.map(go, todo))
+    save_manifest(manifest)
+    print("submitted %d job(s)" % sum(1 for j in todo if j["jobid"]))
+    if args.no_wait:
+        print("Not waiting. Check later with:\n  hpctest report %s" % rundir)
+        return 0
+    wait_for_jobs(jobs, site, manifest, args)
+    save_manifest(manifest)
+    return report(manifest, site, args)
+
+
+def node_rows(jobs):
+    """One row per node, worst status first-class: any failure beats PENDING beats PASS."""
+    order, groups = [], {}
+    for j in jobs:
+        n = j.get("target")
+        if n not in groups:
+            order.append(n)
+            groups[n] = []
+        groups[n].append(j)
+    rows = []
+    for n in order:
+        js = groups[n]
+        bad = [j for j in js if j["status"] not in ("PASS", "SKIP", "PENDING", None)]
+        waiting = [j for j in js if j["status"] in ("PENDING", None)]
+        if bad:
+            status = min((j["status"] for j in bad), key=STATUS_ORDER.index)
+            detail = "; ".join("%s %s%s" % (j["test"], j["status"],
+                                            ": " + j["detail"] if j["detail"] else "")
+                               for j in bad)
+        elif waiting:
+            status, detail = "PENDING", ", ".join(j["test"] for j in waiting) + " not finished"
+        elif all(j["status"] == "SKIP" for j in js):
+            status, detail = "SKIP", js[0]["detail"]
+        else:
+            status = "PASS"
+            skipped = [j["test"] for j in js if j["status"] == "SKIP"]
+            detail = "skipped: " + ", ".join(skipped) if skipped else ""
+        rows.append(dict(node=n, partition=js[0].get("partition", ""), status=status,
+                         detail=detail, tests=len(js),
+                         passed=sum(1 for j in js if j["status"] == "PASS")))
+    return rows
+
+
+def report_nodes(manifest, args):
+    rows = node_rows(manifest["jobs"])
+    show = rows if getattr(args, "verbose", False) else [r for r in rows
+                                                         if r["status"] != "PASS"]
+    width = max([len(r["node"]) for r in rows] + [4])
+    if show:
+        print()
+        print("%-7s  %-*s  %-10s  %s" % ("STATUS", width, "NODE", "PARTITION", "DETAIL"))
+        print("%-7s  %-*s  %-10s  %s" % ("-" * 7, width, "-" * width, "-" * 10, "-" * 40))
+        for r in show:
+            print("%s  %-*s  %-10s  %s" % (color(r["status"], "%-7s" % r["status"]), width,
+                                           r["node"], r["partition"], r["detail"][:120]))
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print("\nNodes: %d  " % len(rows) + ", ".join("%d %s" % (counts[s], s) for s in STATUS_ORDER
+                                                if s in counts))
+    bad = [r["node"] for r in rows if r["status"] not in ("PASS", "SKIP", "PENDING")]
+    if bad:
+        print("Nodes with failures: " + ",".join(bad))
+    with open(os.path.join(manifest["rundir"], "nodes.tsv"), "w") as fh:
+        fh.write("node\tpartition\tstatus\tpassed\ttests\tdetail\n")
+        for r in rows:
+            fh.write("\t".join([r["node"], r["partition"], r["status"], str(r["passed"]),
+                                str(r["tests"]), r["detail"].replace("\t", " ")]) + "\n")
+
+
 def save_manifest(manifest):
     tmp = os.path.join(manifest["rundir"], ".manifest.json.tmp")
     with open(tmp, "w") as fh:
@@ -1116,21 +1339,25 @@ def summarize(jobs):
 def report(manifest, site, args):
     rows = summarize(manifest["jobs"])
     rundir = manifest["rundir"]
-    width = max([len(r["id"]) for r in rows] + [4])
-    print()
-    print("%-7s  %-*s  %5s  %s" % ("STATUS", width, "TEST", "PASS", "DETAIL"))
-    print("%-7s  %-*s  %5s  %s" % ("-" * 7, width, "-" * width, "-" * 5, "-" * 40))
-    for r in rows:
-        print("%s  %-*s  %5s  %s" % (color(r["status"], "%-7s" % r["status"]), width, r["id"],
-                                     "%d/%d" % (r["passed"], r["runs"]), r["detail"][:110]))
-    counts = {}
-    for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    print("\nSummary: " + ", ".join("%d %s" % (counts[s], s) for s in STATUS_ORDER
-                                    if s in counts))
-    failed_nodes = sorted({n for r in rows for n in r["failed_nodes"]})
-    if failed_nodes and getattr(args, "nodes", False):
-        print("Nodes with failures: " + " ".join(failed_nodes))
+    if manifest.get("mode") == "nodes":
+        report_nodes(manifest, args)            # one line per node instead of per test
+    else:
+        width = max([len(r["id"]) for r in rows] + [4])
+        print()
+        print("%-7s  %-*s  %5s  %s" % ("STATUS", width, "TEST", "PASS", "DETAIL"))
+        print("%-7s  %-*s  %5s  %s" % ("-" * 7, width, "-" * width, "-" * 5, "-" * 40))
+        for r in rows:
+            print("%s  %-*s  %5s  %s" % (color(r["status"], "%-7s" % r["status"]), width,
+                                         r["id"], "%d/%d" % (r["passed"], r["runs"]),
+                                         r["detail"][:110]))
+        counts = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        print("\nSummary: " + ", ".join("%d %s" % (counts[s], s) for s in STATUS_ORDER
+                                        if s in counts))
+        failed_nodes = sorted({n for r in rows for n in r["failed_nodes"]})
+        if failed_nodes and getattr(args, "nodes", False):
+            print("Nodes with failures: " + " ".join(failed_nodes))
 
     if not args.quiet:
         shown = False
@@ -1964,6 +2191,8 @@ everyday use:
   hpctest run mpi_hello tag:gpu 'r_*'   names, tags, wildcards
   hpctest run mpi_hello --set mpi=mvapich2      try another module or parameter
   hpctest run --all --no-wait           then: hpctest report <run-dir>
+  hpctest nodes                         node profile on every usable node, one line per node
+  hpctest nodes --partition gpu --dry-run       which nodes would be tested, and why not
   hpctest modules                       load every module in the catalog
   hpctest modules --with gcc openmpi    ... including those behind gcc + openmpi
 
@@ -2014,7 +2243,7 @@ def main(argv=None):
         p.add_argument("-r", "--repeat", type=int, help="run each test N times")
         p.add_argument("--need", type=int, help="with -r: passes needed (default: all)")
         p.add_argument("--workdir", help="where run directories go (default: site.conf)")
-        p.add_argument("--timeout", type=int, default=120, help="minutes to wait (120)")
+        p.add_argument("--timeout", type=int, default=30, help="minutes to wait (30)")
         p.add_argument("--cancel-on-timeout", action="store_true")
         p.add_argument("-n", "--nodes", action="store_true", help="list nodes with failures")
         p.add_argument("--syslog", action="store_true", help="log results with logger(1)")
@@ -2054,6 +2283,30 @@ def main(argv=None):
     p.add_argument("-k", "--keep", action="store_true", help="keep passing test directories")
     p.set_defaults(func=cmd_run)
 
+    p = sub.add_parser("nodes", help="run a profile (default: node) on every node, "
+                                      "one job per test per node")
+    sitearg(p)
+    selection(p)
+    p.add_argument("--partition", action="append", metavar="PART[,PART]",
+                   help="only nodes in these partitions (default: all)")
+    p.add_argument("-w", "--nodelist", metavar="HOSTLIST",
+                   help="only these nodes, Slurm hostlist syntax, e.g. pax[001-040]")
+    p.add_argument("-x", "--exclude", action="append", metavar="GLOB[,GLOB]",
+                   help="skip nodes matching these globs, e.g. 'pax00*'")
+    p.add_argument("--states", action="append", metavar="STATE[,STATE]",
+                   help="sinfo states to test (default: %s)" % ",".join(USABLE_STATES))
+    p.add_argument("--wait-exclusive", action="store_true",
+                   help="queue whole-node tests on busy nodes too (default: idle nodes only)")
+    p.add_argument("--dry-run", action="store_true", help="show the node plan, submit nothing")
+    p.add_argument("--workdir", help="where run directories go (default: site.conf)")
+    p.add_argument("--timeout", type=int, default=30, help="minutes to wait (30)")
+    p.add_argument("--cancel-on-timeout", action="store_true")
+    p.add_argument("--no-wait", action="store_true", help="submit and exit")
+    p.add_argument("-k", "--keep", action="store_true", help="keep passing test directories")
+    p.add_argument("-v", "--verbose", action="store_true", help="list passing nodes too")
+    p.add_argument("--syslog", action="store_true", help="log results with logger(1)")
+    p.set_defaults(func=cmd_nodes)
+
     p = sub.add_parser("report", help="(re)check a run directory")
     sitearg(p)
     p.add_argument("rundir")
@@ -2062,6 +2315,8 @@ def main(argv=None):
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("-k", "--keep", action="store_true")
     p.add_argument("-n", "--nodes", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="'hpctest nodes' runs: list passing nodes too")
     p.add_argument("--syslog", action="store_true")
     p.set_defaults(func=cmd_report)
 
