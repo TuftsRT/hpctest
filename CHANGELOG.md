@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `hpctest nodes`: runs a profile (default `node`) once on every node, one job per test
+  per node, and reports one line per node plus `nodes.tsv`. Skips down/drained/
+  unresponsive nodes, whole-node tests on busy nodes, and GPU tests on CPU nodes, with
+  the reason shown. `--partition`, `-w/--nodelist`, `-x/--exclude`, `--states`,
+  `--dry-run`, `--no-wait` (then `hpctest report`).
+- `run` and `calibrate` wait at most 30 minutes for jobs by default (was 120);
+  `--timeout` still sets it.
 - Compiler/MPI detection: `hpctest site init` and the new `hpctest check --fix` find, for
   each test whose modules fail to load or load with a version swap, an installed
   `compiler`/`mpi` version that loads cleanly. They write it to `[params:<test>]`, and

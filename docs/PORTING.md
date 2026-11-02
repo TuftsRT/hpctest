@@ -144,7 +144,12 @@ Site profiles in `sites/mysite/profiles/` override core profiles of the same nam
 ```cron
 # Nightly health check, results to syslog (tag hpctest)
 30 2 * * * cd /path/hpctest && HPCTEST_SITE=mysite bin/hpctest run -p default -q --syslog --cancel-on-timeout >> /var/log/hpctest.log 2>&1
+# Nightly per-node sweep; nodes.tsv in the run directory has one row per node
+0 3 * * * cd /path/hpctest && HPCTEST_SITE=mysite bin/hpctest nodes -q --syslog --cancel-on-timeout >> /var/log/hpctest-nodes.log 2>&1
 ```
+
+Both wait at most 30 minutes for their jobs (`--timeout`). `--cancel-on-timeout` stops
+jobs that are still queued from piling up night after night.
 
 Exit status is 0 only when nothing failed. `results.json` in each run directory is easy to
 feed into dashboards.

@@ -52,6 +52,7 @@ class Sandbox(unittest.TestCase):
             purge = true
             [slurm]
             max_exclusive_nodes = 2
+            gpu_partition = gpu
             [aliases]
             gcc = gcc/12
             nothing =
@@ -372,6 +373,94 @@ class TestLocalRun(Sandbox):
         _, rows = self.run_local("noisy", "quiet")
         self.assertEqual(rows["noisy"]["status"], "FAIL")
         self.assertEqual(rows["quiet"]["status"], "PASS")
+
+
+class TestNodes(Sandbox):
+    """hpctest nodes: one job per test per node, with sinfo and sbatch faked."""
+
+    SINFO = ("n1|batch*|idle|(null)\nn1|preempt|idle|(null)\n"
+             "n2|batch*|mix|(null)\nn2|preempt|mix|(null)\n"
+             "g1|gpu|mix|gpu:a100:2(S:0)\ng1|preempt|mix|gpu:a100:2(S:0)\n"
+             "n3|batch*|drain|(null)\nn4|batch*|idle*|(null)\n"
+             "n5|batch*|alloc|(null)\n")
+
+    def run_nodes(self, *tests, **kw):
+        calls = []
+
+        def fake_run(cmd, **_):
+            calls.append(cmd)
+            if cmd[0] == "sinfo":
+                return types.SimpleNamespace(returncode=0, stdout=self.SINFO, stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="%d\n" % len(calls), stderr="")
+
+        opts = dict(tests=list(tests), profile=None, all=False, set=None, jobs=1, quiet=True,
+                    partition=None, nodelist=None, exclude=None, states=None,
+                    wait_exclusive=False, dry_run=False, workdir=None, timeout=1,
+                    cancel_on_timeout=False, no_wait=True, keep=True, verbose=False,
+                    syslog=False, sbatch=["--account=lab"], site="lab")
+        opts.update(kw)
+        args = types.SimpleNamespace(**opts)
+        saved = (h.run_cmd, h.shutil.which, sys.stdout)
+        h.run_cmd, h.shutil.which = fake_run, (lambda name: "/usr/bin/" + name)
+        sys.stdout = open(os.devnull, "w")
+        try:
+            rc = h.cmd_nodes(args)
+        finally:
+            sys.stdout.close()
+            h.run_cmd, h.shutil.which, sys.stdout = saved
+        return rc, args, calls
+
+    def test_plan_and_submit(self):
+        self.add_test("health", "echo ok\n", "ok\n")
+        self.add_test("whole", "#@ exclusive: yes\necho ok\n", "ok\n")
+        self.add_test("gpu", "#@ gpus: 1\necho ok\n", "ok\n")
+        rc, args, calls = self.run_nodes("health", "whole", "gpu")
+        self.assertEqual(rc, 0)
+        jobs = {j["id"]: j for j in h.load_manifest(args.rundir)["jobs"]}
+        status = {k: j["status"] for k, j in jobs.items()}
+        self.assertEqual(status, {
+            "health@g1": None, "whole@g1": "SKIP", "gpu@g1": None,
+            "health@n1": None, "whole@n1": None, "gpu@n1": "SKIP",
+            "health@n2": None, "whole@n2": "SKIP", "gpu@n2": "SKIP",
+            "health@n3": "SKIP", "whole@n3": "SKIP", "gpu@n3": "SKIP",
+            "health@n4": "SKIP", "whole@n4": "SKIP", "gpu@n4": "SKIP",
+            "health@n5": "SKIP", "whole@n5": "SKIP", "gpu@n5": "SKIP"})
+        self.assertIn("every CPU in use", jobs["health@n5"]["detail"])
+        self.assertIn("drain", jobs["health@n3"]["detail"])
+        self.assertIn("idle*", jobs["health@n4"]["detail"])
+        self.assertIn("no GPU", jobs["gpu@n1"]["detail"])
+        sb = [c for c in calls if c[0] == "sbatch"]
+        self.assertEqual(len(sb), 5)
+        g1 = next(c for c in sb if "--nodelist=g1" in c)
+        self.assertIn("--partition=gpu", g1)          # first partition; no default for g1
+        self.assertIn("--account=lab", g1)
+        n1 = next(c for c in sb if "--nodelist=n1" in c)
+        self.assertIn("--partition=batch", n1)        # the default partition wins
+        self.assertTrue(jobs["health@n1"]["dir"].endswith(os.path.join("n1", "health")))
+
+    def test_filters(self):
+        self.add_test("health", "echo ok\n", "ok\n")
+        _, args, calls = self.run_nodes("health", partition=["preempt"], exclude=["n2"],
+                                        wait_exclusive=True)
+        sinfo = next(c for c in calls if c[0] == "sinfo")
+        self.assertEqual(sinfo[sinfo.index("-p") + 1], "preempt")
+        ids = {j["id"] for j in h.load_manifest(args.rundir)["jobs"]}
+        self.assertNotIn("health@n2", ids)
+        g1 = next(c for c in calls if c[0] == "sbatch" and "--nodelist=g1" in c)
+        self.assertIn("--partition=preempt", g1)
+
+    def test_node_rows(self):
+        def job(node, test, status, detail=""):
+            return dict(target=node, partition="batch", test=test, status=status,
+                        detail=detail)
+        rows = {r["node"]: r for r in h.node_rows([
+            job("a", "x", "PASS"), job("a", "y", "SKIP", "busy"),
+            job("b", "x", "PASS"), job("b", "y", "FAIL", "clock off"),
+            job("c", "x", "PENDING"), job("d", "x", "SKIP", "node is drain")])}
+        self.assertEqual({k: r["status"] for k, r in rows.items()},
+                         {"a": "PASS", "b": "FAIL", "c": "PENDING", "d": "SKIP"})
+        self.assertIn("y FAIL: clock off", rows["b"]["detail"])
+        self.assertEqual(rows["d"]["detail"], "node is drain")
 
 
 if __name__ == "__main__":

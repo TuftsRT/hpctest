@@ -31,6 +31,7 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
 - [Tests](#tests)
 - [Profiles](#profiles)
 - [Benchmarks and baselines](#benchmarks-and-baselines)
+- [Checking every node](#checking-every-node)
 - [Adopting hpctest at your site](#adopting-hpctest-at-your-site)
 - [Writing tests](#writing-tests)
 - [Repository layout](#repository-layout)
@@ -39,7 +40,7 @@ GPU that runs slow, a node whose hardware doesn't match its Slurm definition.
 
 ## Requirements
 
-- Slurm (`sbatch`, `squeue`, `sacct`, `scontrol`)
+- Slurm (`sbatch`, `squeue`, `sacct`, `scontrol`, `sinfo`)
 - Lmod, or Environment Modules 4+
 - bash and Python 3.6 or newer
 - A file system shared by the submit host and the compute nodes (for run directories)
@@ -75,6 +76,7 @@ hpctest check            # ~30 s, no jobs: can every test's modules be loaded he
 hpctest run -p quick     # ~5 min smoke test: compiler, OpenMP, MPI, Python, R, cgroups
 hpctest run -p default   # main health check
 hpctest run -p full      # everything, incl. GPU tests and benchmarks
+hpctest nodes            # node health checks on every usable node, one line per node
 ```
 
 The site is chosen by hostname (`[site] match` in each `site.conf`), by
@@ -195,7 +197,8 @@ real-world example.
 | `hpctest show TEST` | parameters, modules and exact `sbatch` options this site will use |
 | `hpctest check [TESTS / -p PROFILE] [--fix]` | load each test's modules on this node; no jobs. Flags modules a later load silently swapped. `--fix` writes working compiler/MPI versions and `[disabled]` entries to `site.conf` |
 | `hpctest run TESTS / -p PROFILE / tag:TAG / --all` | submit, wait, report |
-| `hpctest report RUNDIR [--recheck]` | (re)evaluate a run, e.g. after `--no-wait` or new baselines |
+| `hpctest nodes [TESTS / -p PROFILE] [--partition P] [-w HOSTLIST] [--dry-run]` | run a profile (default `node`) once on every usable node; one line per node |
+| `hpctest report RUNDIR [--recheck] [-v]` | (re)evaluate a run, e.g. after `--no-wait` or new baselines; `-v` lists passing nodes of a `nodes` run |
 | `hpctest modules [GLOBS] [--with MODS]` | load every module in the catalog, report broken ones |
 | `hpctest calibrate ... / --from RUNDIR...` | measure benchmark baselines into `baselines.conf` |
 | `hpctest site list / show / init NAME` | inspect sites, or probe this cluster and draft a new one |
@@ -212,7 +215,7 @@ Useful `run` options:
 | `--no-wait` | submit and exit; check later with `hpctest report` |
 | `-k`, `--keep` | keep directories of passing jobs too |
 | `-n`, `--nodes` | list nodes that had failures |
-| `--timeout MIN`, `--cancel-on-timeout` | how long to wait for the queue |
+| `--timeout MIN`, `--cancel-on-timeout` | how long to wait for jobs (default 30 min); cancel what is still queued then |
 | `--syslog` | log one line per test with `logger -t hpctest` |
 | `-- SBATCH_OPTS` | passed to every `sbatch`, e.g. `-- --constraint=a100 --exclude=n12` |
 
@@ -241,7 +244,7 @@ Useful `run` options:
 |---------|----------|
 | `quick` | C, OpenMP, MPI, Python, R, SQLite, cgroup CPU and memory limits, node basics |
 | `scheduler` | cgroups, OOM kill, exclusive allocation, multi-node `srun`, node hardware vs. Slurm config, step time limits, job arrays, dependencies, `sacct` accounting, `srun --mpi` launch, per-task CPU binding |
-| `node` | clock sync, user/group lookup, DNS, `/tmp` space, file systems, RDMA ports, hardware vs. Slurm config |
+| `node` | clock sync, user/group lookup, DNS, `/tmp` space, file systems, RDMA ports, hardware vs. Slurm config; run it on every node with [`hpctest nodes`](#checking-every-node) |
 | `containers` | Apptainer: image pull, user, bind mounts, exit codes; MPI inside a container |
 | `compilers` | GCC, Intel oneAPI, LLVM and NVHPC (C, Fortran, OpenMP), CUDA, CMake build |
 | `mpi` | OpenMPI and MVAPICH2 with GCC and oneAPI, Intel MPI; multi-node data correctness (Open MPI, Intel MPI, MVAPICH2), MPI-IO, hybrid MPI+OpenMP, PnetCDF, ScaLAPACK |
@@ -293,6 +296,62 @@ hpctest calibrate -p benchmarks -r 3 -- --constraint=icelake
 hpctest calibrate --from RUNDIR [RUNDIR ...]     # from runs you already have
 ```
 
+Benchmarks want whole nodes, which can queue for longer than the default 30-minute
+`--timeout`. On a busy cluster add `--timeout 180`, or submit with
+`hpctest run -p benchmarks -r 3 --no-wait` and later `hpctest calibrate --from RUNDIR`.
+
+## Checking every node
+
+Node problems usually affect one node, not a whole partition, so `hpctest nodes` runs
+the `node` profile once on every node, pinned with `--partition`/`--nodelist`, and
+reports one line per node:
+
+```bash
+hpctest nodes --dry-run                 # which nodes would be tested, and what is skipped
+hpctest nodes                           # every usable node, all partitions; waits, then reports
+hpctest nodes --partition gpu --no-wait # submit only; later: hpctest report RUNDIR [-v]
+hpctest nodes node_health -w 'pax[001-040]' -x pax013
+```
+
+- Nodes that are down, drained, fully allocated (`alloc`: a pinned job would wait for
+  the node's current jobs to end), not responding, powered off, etc. are reported as SKIP
+  with their state rather than submitted to (`--states` changes the accepted states).
+- Each node is tested through the partition given with `--partition`, else the cluster
+  default partition, else the first one it is in.
+- Whole-node tests (`slurm_node_config`) run only on idle nodes unless `--wait-exclusive`
+  is given; GPU tests run only on nodes with a `gpu` gres.
+- The run directory holds `nodes.tsv` (one row per node) next to `results.tsv`.
+  `-v` lists passing nodes too. The run directory must be on a shared file system.
+- It waits up to 30 minutes (`--timeout`); add `--cancel-on-timeout` to cancel jobs still
+  queued then. Nodes still waiting are reported as PENDING.
+- `node_health` and `node_rdma` check only what you configure: set `fs_paths`, `fs_write`
+  and `rdma_rate` in `[params]` (see [Adopting hpctest](#adopting-hpctest-at-your-site)).
+
+An illustrative, abridged nodes run (only nodes that are not PASS are listed; `-v` lists all):
+
+```
+$ hpctest nodes --partition batch
+hpctest 1.0.0  site: tufts  nodes: 120 (31 skipped)  tests/node: 3  jobs: 205
+...
+STATUS   NODE    PARTITION   DETAIL
+-------  ------  ----------  ----------------------------------------
+FAIL     pax041  batch       node_health FAIL: stdout mismatch at line 4
+SKIP     pax001  batch       node is drain
+SKIP     pax002  batch       node is alloc (every CPU in use; --states idle,mix,comp,plnd,alloc to queue anyway)
+
+Nodes: 120  88 PASS, 1 FAIL, 31 SKIP
+Nodes with failures: pax041
+
+Failure details:
+
+[FAIL] node_health@pax041  node pax041
+    stdout mismatch at line 4
+    stdout mismatch at line 4:
+        expected: tmp space: ok
+        got:      tmp space: FAILED (/tmp has 3 GB free, need 10)
+```
+
+
 ## Adopting hpctest at your site
 
 ```bash
@@ -342,13 +401,6 @@ A few tests need site values in `[params]` (`hpctest show <test>` lists a test's
 | `rdma_rate`, `rdma_min_ports` | `node_rdma` | `100` (Gb/s), `1` |
 | `image`, `bind_paths` | `apptainer`, `apptainer_gpu` | a local `.sif` if compute nodes can't reach Docker Hub |
 | `mpi_image`, `srun_mpi` | `apptainer_mpi` | a `.sif` with an MPI built for PMIx or PMI-2 |
-
-Node problems usually affect one node, not a whole partition, so run the `node` profile
-on each node:
-
-```bash
-for n in $(sinfo -h -N -p batch -o %N | sort -u); do hpctest run -p node --no-wait -- -w $n; done
-```
 
 ## Writing tests
 
